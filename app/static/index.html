@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vida Organizer — Central F:\Vida</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Status Header -->
+    <header class="top-bar">
+      <div class="brand-status">
+        <span id="watch-dot" class="status-dot active"></span>
+        <div>
+          <div class="brand-title">
+            Vida Organizer · Central: <code id="vida-root-label">F:\Vida</code>
+            <button id="btn-toggle-watch" class="pill-btn" title="Pausar/Retomar Vigia Automático">Vigia Ativo</button>
+          </div>
+          <div id="disk-summary" class="brand-subtitle">
+            Escaneando pastas do seu PC...
+          </div>
+        </div>
+      </div>
+
+      <div class="top-actions">
+        <button id="btn-refresh" class="btn btn-ghost" title="Re-escanear pastas">🔄 Atualizar</button>
+        <button id="btn-undo" class="btn btn-secondary" disabled>↩ Desfazer última ação</button>
+        <button id="btn-icons" class="btn btn-purple">🎨 Aplicar Ícones Folcolor</button>
+        <button id="btn-organize-all" class="btn btn-primary">✨ Organizar Tudo Agora</button>
+      </div>
+    </header>
+
+    <!-- Toast Banner -->
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- Folder Health Thermometer Cards -->
+    <section class="health-grid" id="health-grid">
+      <!-- Populated by app.js -->
+    </section>
+
+    <!-- Main Two-Column Layout -->
+    <main class="main-columns">
+      <!-- Left Column: Disorganized Queue -->
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>🔍 Fila: O que está Desorganizado agora</h2>
+            <p class="panel-sub">Simulação em tempo real antes de mover · Clique em um item ou organize em lote</p>
+          </div>
+          <span class="cooldown-badge">Auto-move após 2h em Downloads / 15m no F:\Vida</span>
+        </div>
+
+        <div class="filter-tabs" id="queue-tabs">
+          <button class="tab active" data-filter="all">Todos (<span id="count-all">0</span>)</button>
+          <button class="tab" data-filter="pronto_para_mover">📁 Prontos p/ Mover (<span id="count-move">0</span>)</button>
+          <button class="tab" data-filter="espaco_recuperavel">🧹 Espaço Recuperável (<span id="count-rec">0</span>)</button>
+          <button class="tab" data-filter="renomear_sugerido">✏️ Renomear (<span id="count-ren">0</span>)</button>
+          <button class="tab" data-filter="icone_pendente">🎨 Ícones Folcolor (<span id="count-ico">0</span>)</button>
+        </div>
+
+        <!-- Recoverable Space Batch Bar (shown when viewing espaco_recuperavel) -->
+        <div id="recoverable-bar" class="recoverable-bar hidden">
+          <span>Instaladores pesados, duplicados e <code>.zip</code> já extraídos nunca são apagados sozinhos:</span>
+          <div class="rec-actions">
+            <button id="btn-archive-all-rec" class="btn btn-small btn-amber">📦 Arquivar Todos em 04_Arquivo_Morto</button>
+            <button id="btn-trash-all-rec" class="btn btn-small btn-danger">🗑️ Enviar Todos p/ Lixeira</button>
+          </div>
+        </div>
+
+        <div class="queue-list" id="queue-list">
+          <!-- Populated by app.js -->
+        </div>
+      </section>
+
+      <!-- Right Column: Visual Rules & History -->
+      <aside class="right-stack">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>🎨 Regras Visuais (Se → Então + Folcolor)</h2>
+              <p class="panel-sub">Ordem de prioridade das rotas rumo ao <code>F:\Vida</code></p>
+            </div>
+            <button id="btn-new-rule" class="btn btn-small btn-primary">+ Nova Regra</button>
+          </div>
+
+          <div class="rules-list" id="rules-list">
+            <!-- Populated by app.js -->
+          </div>
+
+          <!-- Anti-Goal Shield Card -->
+          <div class="rule-card shield-card">
+            <div class="rule-top">
+              <strong>🛡️ Trava de Proteção (Projetos &amp; Jogos)</strong>
+              <span class="badge-lock">🔒 Intocável</span>
+            </div>
+            <div class="rule-body">
+              <strong>NUNCA</strong> mexer dentro de pastas com <code>.git</code>, <code>node_modules</code>, <code>.venv</code>, <code>SteamLibrary</code>, <code>Riot Games</code> ou projetos de código em <code>C:\Projetos</code>.
+            </div>
+          </div>
+        </section>
+
+        <!-- Recent History & Undo Panel -->
+        <section class="panel">
+          <div class="panel-header">
+            <h2>🕒 Histórico Recente &amp; Desfazer</h2>
+          </div>
+          <div class="history-list" id="history-list">
+            <!-- Populated by app.js -->
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Modal for Creating / Editing a Visual Rule -->
+  <div id="rule-modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">Nova Regra Visual</h3>
+        <button id="btn-close-modal" class="btn-icon">✕</button>
+      </div>
+      <form id="rule-form">
+        <input type="hidden" id="rule-id" />
+        <label>Nome da Regra
+          <input type="text" id="rule-name" placeholder="Ex: Materiais de Inglês" required />
+        </label>
+        <div class="form-row">
+          <label>Categoria Principal (F:\Vida)
+            <select id="rule-category">
+              <option value="02_Areas" data-icon="9">02_Areas (Folcolor #9)</option>
+              <option value="03_Recursos" data-icon="8">03_Recursos (Folcolor #8)</option>
+              <option value="01_Projetos" data-icon="6">01_Projetos (Folcolor #6)</option>
+              <option value="00_Jogos" data-icon="4">00_Jogos (Folcolor #4)</option>
+              <option value="04_Arquivo_Morto" data-icon="15">04_Arquivo_Morto (Folcolor #15)</option>
+              <option value="99_Inbox" data-icon="2">99_Inbox (Folcolor #2)</option>
+            </select>
+          </label>
+          <label>Prioridade (menor roda antes)
+            <input type="number" id="rule-priority" value="35" min="1" max="999" required />
+          </label>
+        </div>
+        <label>Subpasta de Destino dentro do F:\Vida
+          <input type="text" id="rule-subpath" placeholder="Ex: 02_Areas/05_Cursos/Ingles" required />
+        </label>
+        <label>SE o nome contiver palavras-chave (separadas por vírgula — vazio = qualquer nome)
+          <input type="text" id="rule-keywords" placeholder="Ex: aula, slide, prova, ingles" />
+        </label>
+        <div class="form-row">
+          <label>Extensões (separadas por vírgula)
+            <input type="text" id="rule-extensions" placeholder="Ex: pdf, docx, pptx, zip" />
+          </label>
+          <label>Idade mínima (dias parados)
+            <input type="number" id="rule-min-age" value="0" min="0" />
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="btn-cancel-modal" class="btn btn-ghost">Cancelar</button>
+          <button type="submit" class="btn btn-primary">Salvar Regra</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
