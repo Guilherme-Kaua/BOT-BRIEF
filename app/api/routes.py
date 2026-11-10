@@ -130,9 +130,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Pasta não encontrada")
         if os.name == "nt":
             if p.exists() and p.is_file():
-                subprocess.Popen(["explorer", "/select,", str(p)])
+                subprocess.Popen(["explorer", f"/select,{p}"])
             else:
                 os.startfile(str(target))
         return {"opened": str(target)}
 
     return app
+

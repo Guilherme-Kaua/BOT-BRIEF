@@ -74,3 +74,4 @@ def is_file_locked(path: Path) -> bool:
             return False
     except (PermissionError, OSError):
         return True
+

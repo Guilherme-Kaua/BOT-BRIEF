@@ -49,3 +49,12 @@ def test_api_scan_execute_and_undo_flow(tmp_path: Path):
     assert r_undo.status_code == 200
     assert r_undo.json()["undone_count"] == 1
     assert pdf.exists()
+
+
+def test_app_js_and_open_folder_escaping():
+    app_js = (Path(__file__).resolve().parent.parent / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'onclick="openInExplorer(${JSON.stringify' not in app_js
+    routes_py = (Path(__file__).resolve().parent.parent / "app" / "api" / "routes.py").read_text(encoding="utf-8")
+    assert 'f"/select,{p}"' in routes_py
+
+

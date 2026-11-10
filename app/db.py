@@ -29,7 +29,7 @@ DEFAULT_RULES: list[dict] = [
             "SportHub",
         ],
         "extensions": ["pdf", "docx", "pptx", "xlsx", "txt", "zip", "md"],
-        "source_scopes": ["Downloads", "Documents", "02_Areas", "03_Recursos", "04_Arquivo_Morto"],
+        "source_scopes": ["Downloads", "Desktop", "Documents", "02_Areas", "03_Recursos", "04_Arquivo_Morto"],
         "min_age_days": 0,
         "enabled": 1,
     },
@@ -354,3 +354,4 @@ class Database:
                 if b:
                     result.append(b)
             return result
+

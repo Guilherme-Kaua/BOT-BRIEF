@@ -31,6 +31,51 @@ def test_duplicates_and_older_revisions_detected(tmp_path: Path):
     assert any(Path(i["source_path"]) == v4 for i in items)
 
 
+def test_duplicates_keeps_vida_copy_over_downloads(tmp_path: Path):
+    dl = tmp_path / "Downloads"
+    vida_sub = tmp_path / "Vida" / "02_Areas"
+    dl.mkdir(parents=True)
+    vida_sub.mkdir(parents=True)
+
+    # Shorter name in Downloads, longer name in Vida — Vida must still be kept!
+    f_dl = dl / "a.pdf"
+    f_vida = vida_sub / "AlumiGest_Completo.pdf"
+    f_dl.write_bytes(b"identical-pdf-payload")
+    f_vida.write_bytes(b"identical-pdf-payload")
+
+    items = find_duplicates_and_revisions([dl, vida_sub], prefer_keep_root=tmp_path / "Vida")
+    flagged = {Path(i["source_path"]) for i in items}
+    assert f_dl in flagged
+    assert f_vida not in flagged
+
+
+def test_scanner_includes_desktop_dir(tmp_path: Path):
+    desktop = tmp_path / "Desktop"
+    vida = tmp_path / "Vida"
+    desktop.mkdir()
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+
+    loose_desk = desktop / "AlumiGest_Desktop.pdf"
+    loose_desk.write_bytes(b"pdf")
+
+    cfg = AppConfig(
+        downloads_dir=tmp_path / "Downloads",
+        desktop_dir=desktop,
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "desk.db",
+    )
+    db = Database(cfg.db_path)
+    db.init_db()
+
+    report = scan_all(cfg, db)
+    sources = {Path(i["source_path"]) for i in report["queue"]}
+    assert loose_desk in sources
+
+
+
 def test_scan_all_classifies_downloads_and_vida_roots(tmp_path: Path):
     dl = tmp_path / "Downloads"
     vida = tmp_path / "Vida"
@@ -64,3 +109,4 @@ def test_scan_all_classifies_downloads_and_vida_roots(tmp_path: Path):
     assert "espaco_recuperavel" in categories
     assert "icone_pendente" in categories
     assert report["summary"]["recoverable_bytes"] >= 2048
+

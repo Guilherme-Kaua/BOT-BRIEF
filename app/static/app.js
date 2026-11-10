@@ -148,10 +148,11 @@ function renderQueue() {
         <div class="qi-sub">${item.reason} · <code>${item.source_path}</code></div>
       </div>
       <div class="qi-actions">
-        <button class="btn btn-small btn-ghost" title="Ver no Explorer" onclick="openInExplorer(${JSON.stringify(item.source_path)})">📂</button>
+        <button class="btn btn-small btn-ghost btn-open-explorer" title="Ver no Explorer">📂</button>
         ${actionButtons}
       </div>
     `;
+    row.querySelector(".btn-open-explorer").addEventListener("click", () => openInExplorer(item.source_path));
     list.appendChild(row);
   }
 }
@@ -353,3 +354,4 @@ document.getElementById("rule-form").addEventListener("submit", async (e) => {
 });
 
 fetchScan();
+

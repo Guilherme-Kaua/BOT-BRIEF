@@ -45,3 +45,4 @@ def test_scan_missing_icons_covers_first_and_second_level_subfolders(tmp_path: P
     paths = {Path(item["path"]) for item in missing}
     assert sub1 in paths
     assert sub2 in paths
+

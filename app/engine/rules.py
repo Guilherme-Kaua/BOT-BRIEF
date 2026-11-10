@@ -26,10 +26,13 @@ UNSTANDARDIZED_FOLDER_PATTERNS = [
 ]
 
 
+MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4"}
+
+
 def normalize_text(text: str) -> str:
     nfkd = unicodedata.normalize("NFKD", text)
     without_accents = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
-    return without_accents.lower()
+    return re.sub(r"[-_\s]+", " ", without_accents).strip().lower()
 
 
 def suggest_clean_name(path: Path) -> str | None:
@@ -58,7 +61,7 @@ def suggest_clean_name(path: Path) -> str | None:
         short_id = m_gem.group(1)[:6].lower()
         return f"Gemini_{date_prefix}_{short_id}{ext}"
 
-    if HEX_HASH_RE.match(stem) or NUMERIC_ONLY_RE.match(stem):
+    if ext in MEDIA_EXTENSIONS and (HEX_HASH_RE.match(stem) or NUMERIC_ONLY_RE.match(stem)):
         short_id = stem[:6].lower()
         return f"Img_{date_prefix}_{short_id}{ext}"
 
@@ -121,3 +124,4 @@ def evaluate_file(
         }
 
     return None
+

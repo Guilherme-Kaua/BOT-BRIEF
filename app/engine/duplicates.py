@@ -107,8 +107,21 @@ def find_installers(directory: Path) -> list[dict]:
     return results
 
 
-def find_duplicates_and_revisions(directories: list[Path]) -> list[dict]:
+def find_duplicates_and_revisions(
+    directories: list[Path],
+    prefer_keep_root: Path | None = None,
+) -> list[dict]:
     files: list[Path] = []
+    keep_root_resolved = Path(prefer_keep_root).resolve() if prefer_keep_root else None
+
+    def _is_preferred(p: Path) -> bool:
+        if keep_root_resolved is None:
+            return False
+        try:
+            p.resolve().relative_to(keep_root_resolved)
+            return True
+        except ValueError:
+            return False
     for d in directories:
         dp = Path(d)
         if not dp.exists():
@@ -149,9 +162,14 @@ def find_duplicates_and_revisions(directories: list[Path]) -> list[dict]:
         for digest, dup_group in by_hash.items():
             if len(dup_group) < 2:
                 continue
-            sorted_dups = sorted(dup_group, key=lambda p: (len(p.name), -p.stat().st_mtime))
+            sorted_dups = sorted(
+                dup_group,
+                key=lambda p: (not _is_preferred(p), len(p.name), -p.stat().st_mtime),
+            )
             keeper = sorted_dups[0]
             for extra in sorted_dups[1:]:
+                if _is_preferred(extra) and not _is_preferred(keeper):
+                    continue
                 sp = str(extra)
                 if sp not in flagged_paths:
                     flagged_paths.add(sp)
@@ -196,3 +214,4 @@ def find_duplicates_and_revisions(directories: list[Path]) -> list[dict]:
                 )
 
     return results
+

@@ -27,3 +27,4 @@ class AppConfig:
     downloads_cooldown_minutes: int = 120
     vida_root_cooldown_minutes: int = 15
     port: int = 18420
+

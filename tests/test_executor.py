@@ -77,3 +77,37 @@ def test_undo_batch_handles_missing_file_gracefully(tmp_path: Path):
     undo_res = undo_batch(res["batch_id"], db)
     assert undo_res["undone_count"] == 0
     assert undo_res["skipped_count"] == 1
+
+
+def test_collision_identical_hash_skips_v2_duplicate(tmp_path: Path):
+    cfg = _make_cfg(tmp_path)
+    db = Database(cfg.db_path)
+    db.init_db()
+
+    src = tmp_path / "Downloads" / "Aula01.pdf"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"same-bytes-content")
+
+    dst_dir = cfg.vida_root / "02_Areas" / "01_Faculdade" / "ADS"
+    dst_dir.mkdir(parents=True)
+    existing = dst_dir / "Aula01.pdf"
+    existing.write_bytes(b"same-bytes-content")
+
+    res = execute_queue_items(
+        [
+            {
+                "id": "dup1",
+                "category": "pronto_para_mover",
+                "source_path": str(src),
+                "target_path": str(existing),
+                "folcolor_index": 9,
+            }
+        ],
+        db,
+        cfg,
+    )
+    assert res["executed_count"] == 0
+    assert res["skipped_count"] == 1
+    assert not (dst_dir / "Aula01_v2.pdf").exists()
+
+

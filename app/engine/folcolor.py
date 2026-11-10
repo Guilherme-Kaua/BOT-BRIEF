@@ -144,3 +144,4 @@ def scan_missing_icons(vida_root: Path, folcolor_exe: Path, max_depth: int = 2) 
             _walk(cat_dir, 1, cat_name)
 
     return missing
+

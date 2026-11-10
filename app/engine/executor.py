@@ -4,6 +4,7 @@ from pathlib import Path
 from send2trash import send2trash
 from app.config import AppConfig
 from app.db import Database
+from app.engine.duplicates import _sha256_file
 from app.engine.folcolor import (
     apply_folcolor_icon,
     get_category_icon_resource,
@@ -53,6 +54,23 @@ def execute_queue_items(
             if cat in {"pronto_para_mover", "renomear_sugerido"}:
                 dst = Path(dst_str)
                 dst.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    dst.exists()
+                    and dst.is_file()
+                    and src.is_file()
+                    and dst.resolve() != src.resolve()
+                    and dst.stat().st_size == src.stat().st_size
+                    and _sha256_file(dst) == _sha256_file(src)
+                ):
+                    skipped_count += 1
+                    results.append(
+                        {
+                            "id": item.get("id"),
+                            "status": "skipped",
+                            "reason": "Arquivo idêntico (mesmo SHA-256) já existe no destino",
+                        }
+                    )
+                    continue
                 final_dst = resolve_collision_path(dst, src)
                 shutil.move(str(src), str(final_dst))
 
@@ -201,3 +219,4 @@ def undo_batch(batch_id: int, db: Database) -> dict:
         "skipped_count": skipped_count,
         "details": details,
     }
+

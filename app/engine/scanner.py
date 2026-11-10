@@ -40,7 +40,7 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
     recoverable_items = (
         find_redundant_archives(config.downloads_dir)
         + find_installers(config.downloads_dir)
-        + find_duplicates_and_revisions(scan_dirs)
+        + find_duplicates_and_revisions(scan_dirs, prefer_keep_root=config.vida_root)
     )
 
     for rec in recoverable_items:
@@ -63,9 +63,10 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
             }
         )
 
-    # 2. Scan Downloads & Vida category roots for routing rules & clean renames
+    # 2. Scan Downloads, Desktop, Documents & Vida category roots for routing rules & clean renames
     scope_dirs: list[tuple[str, Path, int]] = [
         ("Downloads", config.downloads_dir, config.downloads_cooldown_minutes),
+        ("Desktop", config.desktop_dir, config.downloads_cooldown_minutes),
         ("Documents", config.documents_dir, config.downloads_cooldown_minutes),
     ]
     for cat in FOLCOLOR_CATEGORY_MAP:
@@ -289,3 +290,4 @@ def _build_folder_cards(
             }
         )
     return cards
+

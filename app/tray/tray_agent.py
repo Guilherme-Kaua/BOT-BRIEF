@@ -142,3 +142,4 @@ class TrayAgent:
             menu,
         )
         self.icon.run()
+

@@ -51,3 +51,21 @@ def test_unstandardized_folder_detection():
     assert is_unstandardized_folder_name("Nova pasta") is True
     assert is_unstandardized_folder_name("Projet 2") is True
     assert is_unstandardized_folder_name("01_Faculdade") is False
+
+
+def test_suggest_clean_name_ignores_numeric_pdfs_and_matches_underscores(tmp_path: Path):
+    num_pdf = tmp_path / "141332026.pdf"
+    num_pdf.write_text("lei")
+    assert suggest_clean_name(num_pdf) is None
+
+    db = Database(tmp_path / "rules2.db")
+    db.init_db()
+    rules = db.list_rules()
+
+    f_under = tmp_path / "Mapa_da_Empatia_Final.docx"
+    f_under.write_text("doc")
+    matched = evaluate_file(f_under, "Downloads", rules)
+    assert matched is not None
+    assert "01_Faculdade" in matched["target_subpath"]
+
+
