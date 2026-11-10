@@ -20,9 +20,13 @@ def resolve_collision_path(target_path: Path, source_path: Path) -> Path:
     if not dst.exists() or dst.resolve() == src.resolve():
         return dst
 
+    is_directory = src.is_dir() or dst.is_dir() or (dst.suffix and dst.suffix[1:].isdigit())
     version = 2
     while True:
-        candidate = dst.parent / f"{dst.stem}_v{version}{dst.suffix}"
+        if is_directory:
+            candidate = dst.parent / f"{dst.name}_v{version}"
+        else:
+            candidate = dst.parent / f"{dst.stem}_v{version}{dst.suffix}"
         if not candidate.exists():
             return candidate
         version += 1

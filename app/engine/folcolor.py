@@ -107,7 +107,8 @@ def scan_missing_icons(vida_root: Path, folcolor_exe: Path, max_depth: int = 2) 
     missing: list[dict] = []
 
     def _walk(current: Path, depth: int, cat_name: str) -> None:
-        if depth > max_depth:
+        cat_limit = 1 if cat_name in {"04_Arquivo_Morto", "99_Inbox"} else max_depth
+        if depth > cat_limit:
             return
         try:
             children = [c for c in current.iterdir() if c.is_dir() and not c.name.startswith(".")]

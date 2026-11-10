@@ -332,7 +332,16 @@ class Database:
     def get_last_undoable_batch(self) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM action_batches WHERE undone = 0 ORDER BY id DESC LIMIT 1"
+                """
+                SELECT b.id FROM action_batches b
+                WHERE b.undone = 0
+                  AND EXISTS (
+                      SELECT 1 FROM action_items i
+                      WHERE i.batch_id = b.id
+                        AND i.action_type IN ('move', 'rename', 'archive', 'icon')
+                  )
+                ORDER BY b.id DESC LIMIT 1
+                """
             ).fetchone()
             if not row:
                 return None

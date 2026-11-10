@@ -1,3 +1,5 @@
+from functools import lru_cache
+import os
 from pathlib import Path
 
 PROTECTED_MARKER_ENTRIES: set[str] = {
@@ -6,7 +8,7 @@ PROTECTED_MARKER_ENTRIES: set[str] = {
     ".venv",
     "pyproject.toml",
     "package.json",
-    "Cargo.toml",
+    "cargo.toml",
 }
 
 PROTECTED_PATH_PARTS: set[str] = {
@@ -33,6 +35,21 @@ ACTIVE_DOWNLOAD_SUFFIXES: set[str] = {
 }
 
 
+@lru_cache(maxsize=4096)
+def _dir_has_project_marker(dir_str: str) -> bool:
+    try:
+        for marker in PROTECTED_MARKER_ENTRIES:
+            if os.path.exists(os.path.join(dir_str, marker)):
+                return True
+        with os.scandir(dir_str) as it:
+            for entry in it:
+                if entry.name.lower().endswith(".sln") and entry.is_file(follow_symlinks=False):
+                    return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
 def is_protected_path(path: Path, projetos_dir: Path | None = None) -> bool:
     p = Path(path)
     parts_lower = {part.lower() for part in p.parts}
@@ -48,14 +65,11 @@ def is_protected_path(path: Path, projetos_dir: Path | None = None) -> bool:
 
     check_dir = p if p.is_dir() else p.parent
     for current in [check_dir, *check_dir.parents]:
-        try:
-            for marker in PROTECTED_MARKER_ENTRIES:
-                if (current / marker).exists():
-                    return True
-            if any(child.suffix.lower() == ".sln" for child in current.iterdir() if child.is_file()):
-                return True
-        except (PermissionError, OSError):
+        # Skip scanning root drive letters like C:\ or F:\
+        if current.parent == current:
             continue
+        if _dir_has_project_marker(str(current)):
+            return True
 
     return False
 
@@ -74,4 +88,3 @@ def is_file_locked(path: Path) -> bool:
             return False
     except (PermissionError, OSError):
         return True
-

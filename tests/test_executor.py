@@ -111,3 +111,16 @@ def test_collision_identical_hash_skips_v2_duplicate(tmp_path: Path):
     assert not (dst_dir / "Aula01_v2.pdf").exists()
 
 
+def test_resolve_collision_on_directory_with_dot_in_name(tmp_path: Path):
+    from app.engine.executor import resolve_collision_path
+
+    src_dir = tmp_path / "Downloads" / "VALORANT FPSPACK   2.0"
+    src_dir.mkdir(parents=True)
+    dst_dir = tmp_path / "Vida" / "00_Jogos" / "Ferramentas" / "VALORANT FPSPACK   2.0"
+    dst_dir.mkdir(parents=True)
+
+    resolved = resolve_collision_path(dst_dir, src_dir)
+    assert resolved.name == "VALORANT FPSPACK   2.0_v2"
+
+
+

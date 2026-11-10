@@ -44,8 +44,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Vida Organizer — BOT-BRIEF")
     parser.add_argument("--no-tray", action="store_true", help="Roda apenas o servidor web sem ícone na bandeja")
     parser.add_argument("--open", action="store_true", help="Abre o painel visual ao iniciar")
+    parser.add_argument("--desktop-only", action="store_true", help="Abre diretamente a janela Desktop nativa")
     parser.add_argument("--port", type=int, default=18420, help="Porta local do painel (padrão: 18420)")
     args = parser.parse_args()
+
+    if args.desktop_only:
+        from app.desktop_gui import launch_desktop_app
+
+        launch_desktop_app(AppConfig(port=args.port))
+        return
 
     port = _find_free_port(args.port)
     config = AppConfig(port=port)

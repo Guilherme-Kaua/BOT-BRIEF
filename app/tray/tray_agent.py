@@ -24,21 +24,14 @@ def create_tray_icon_image() -> Image.Image:
 
 def open_dashboard_window(url: str) -> None:
     if os.name == "nt":
-        candidates = [
-            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
-            / "Microsoft/Edge/Application/msedge.exe",
-            Path(os.environ.get("ProgramFiles", "C:/Program Files"))
-            / "Microsoft/Edge/Application/msedge.exe",
-            Path(os.environ.get("ProgramFiles", "C:/Program Files"))
-            / "Google/Chrome/Application/chrome.exe",
-        ]
-        for browser_exe in candidates:
-            if browser_exe.exists():
-                try:
-                    subprocess.Popen([str(browser_exe), f"--app={url}"])
-                    return
-                except OSError:
-                    pass
+        try:
+            subprocess.Popen(
+                ["pythonw", "-m", "app.main", "--desktop-only"],
+                cwd=str(Path(__file__).resolve().parent.parent.parent),
+            )
+            return
+        except OSError:
+            pass
     webbrowser.open(url)
 
 

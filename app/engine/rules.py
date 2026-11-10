@@ -4,7 +4,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
-HEX_HASH_RE = re.compile(r"^[0-9a-f]{16,64}$", re.IGNORECASE)
+HEX_HASH_RE = re.compile(r"^[0-9a-f]{8,}(?:[._-][0-9a-f]{4,})*$", re.IGNORECASE)
 NUMERIC_ONLY_RE = re.compile(r"^\d{5,}$")
 WHATSAPP_EN_RE = re.compile(
     r"^whatsapp\s+(?:image|video)\s+(\d{4}-\d{2}-\d{2})\s+at\s+(\d{2})[.:](\d{2})",
@@ -61,8 +61,10 @@ def suggest_clean_name(path: Path) -> str | None:
         short_id = m_gem.group(1)[:6].lower()
         return f"Gemini_{date_prefix}_{short_id}{ext}"
 
-    if ext in MEDIA_EXTENSIONS and (HEX_HASH_RE.match(stem) or NUMERIC_ONLY_RE.match(stem)):
-        short_id = stem[:6].lower()
+    if ext in MEDIA_EXTENSIONS and (
+        (HEX_HASH_RE.match(stem) and len(stem) >= 16) or NUMERIC_ONLY_RE.match(stem)
+    ):
+        short_id = re.sub(r"[^0-9a-f]", "", stem.lower())[:6]
         return f"Img_{date_prefix}_{short_id}{ext}"
 
     return None

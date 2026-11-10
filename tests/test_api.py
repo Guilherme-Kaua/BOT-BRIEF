@@ -72,4 +72,74 @@ def test_windowless_pythonw_uvicorn_config_does_not_crash(monkeypatch):
     assert sys.stderr is not None
 
 
+def test_api_execute_uses_in_memory_cache_and_returns_updated_state(tmp_path: Path):
+    dl = tmp_path / "Downloads"
+    vida = tmp_path / "Vida"
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+    dl.mkdir()
+
+    pdf = vida / "02_Areas" / "Aula_Cache.pdf"
+    pdf.write_bytes(b"cache-test")
+
+    cfg = AppConfig(
+        downloads_dir=dl,
+        desktop_dir=tmp_path / "Desktop",
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "cache.db",
+    )
+    app = create_app(cfg)
+    client = TestClient(app)
+
+    r_scan = client.get("/api/scan")
+    item_id = [i["id"] for i in r_scan.json()["queue"] if i["category"] == "pronto_para_mover"][0]
+
+    r_exec = client.post("/api/execute", json={"item_ids": [item_id]})
+    body = r_exec.json()
+    assert body["executed_count"] == 1
+    assert "scan" in body
+    assert all(i["id"] != item_id for i in body["scan"]["queue"])
+
+
+def test_desktop_gui_controller_instant_execute_and_undo(tmp_path: Path):
+    from app.desktop_gui import DesktopController
+
+    dl = tmp_path / "Downloads"
+    vida = tmp_path / "Vida"
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+    dl.mkdir()
+
+    pdf = vida / "02_Areas" / "AlumiGest_DesktopApp.pdf"
+    pdf.write_bytes(b"native-desktop")
+
+    cfg = AppConfig(
+        downloads_dir=dl,
+        desktop_dir=tmp_path / "Desktop",
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "desktop_ctrl.db",
+    )
+    ctrl = DesktopController(cfg)
+    state1 = ctrl.refresh(force=True)
+    move_items = [i for i in state1["queue"] if i["category"] == "pronto_para_mover"]
+    assert len(move_items) == 1
+
+    # Instant in-memory execution without full rescan
+    res = ctrl.execute_item(move_items[0]["id"], include_trash=False, recoverable_mode="archive")
+    assert res["executed_count"] == 1
+    assert len([i for i in ctrl.state["queue"] if i["id"] == move_items[0]["id"]]) == 0
+    assert (vida / "02_Areas" / "01_Faculdade" / "ADS" / "AlumiGest_DesktopApp.pdf").exists()
+
+    # Instant undo
+    undo_res = ctrl.undo_last()
+    assert undo_res["undone_count"] == 1
+    assert pdf.exists()
+
+
+
+
 

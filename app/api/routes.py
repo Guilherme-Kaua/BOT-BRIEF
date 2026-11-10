@@ -1,5 +1,6 @@
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException
@@ -9,7 +10,7 @@ from pydantic import BaseModel
 from app.config import AppConfig
 from app.db import Database
 from app.engine.executor import execute_queue_items, undo_batch
-from app.engine.scanner import scan_all
+from app.engine.scanner import _build_folder_cards, scan_all
 
 
 class ExecuteRequest(BaseModel):
@@ -50,6 +51,22 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     app.state.config = cfg
     app.state.db = db
     app.state.auto_watch_enabled = True
+    app.state.cached_scan = None
+    app.state.cached_at = 0.0
+
+    def _enrich_scan(report: dict[str, Any]) -> dict[str, Any]:
+        report["last_undoable_batch"] = db.get_last_undoable_batch()
+        report["auto_watch_enabled"] = app.state.auto_watch_enabled
+        report["vida_root"] = str(cfg.vida_root)
+        report["rules"] = db.list_rules()
+        report["history"] = db.list_batches(limit=25)
+        return report
+
+    def _get_or_refresh_scan(force: bool = False) -> dict[str, Any]:
+        if force or app.state.cached_scan is None or (time.time() - app.state.cached_at) > 30.0:
+            app.state.cached_scan = scan_all(cfg, db)
+            app.state.cached_at = time.time()
+        return _enrich_scan(app.state.cached_scan)
 
     static_dir = Path(__file__).resolve().parent.parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
@@ -60,16 +77,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return FileResponse(str(static_dir / "index.html"))
 
     @app.get("/api/scan")
-    def api_scan() -> dict[str, Any]:
-        report = scan_all(cfg, db)
-        report["last_undoable_batch"] = db.get_last_undoable_batch()
-        report["auto_watch_enabled"] = app.state.auto_watch_enabled
-        report["vida_root"] = str(cfg.vida_root)
-        return report
+    def api_scan(force: int = 0) -> dict[str, Any]:
+        return _get_or_refresh_scan(force=bool(force))
 
     @app.post("/api/execute")
     def api_execute(req: ExecuteRequest) -> dict[str, Any]:
-        report = scan_all(cfg, db)
+        report = _get_or_refresh_scan(force=False)
         queue = report["queue"]
 
         selected = queue
@@ -87,6 +100,19 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             include_destructive_trash=req.include_trash,
             recoverable_mode=req.recoverable_mode,
         )
+
+        # Update in-memory cache immediately so response is <20ms without rescanning the disk
+        executed_ids = {r["id"] for r in res.get("results", []) if r.get("status") == "executed"}
+        if app.state.cached_scan is not None and executed_ids:
+            remaining = [i for i in app.state.cached_scan["queue"] if i["id"] not in executed_ids]
+            app.state.cached_scan["queue"] = remaining
+            app.state.cached_scan["summary"]["total_disorganized"] = len(remaining)
+            app.state.cached_scan["summary"]["recoverable_bytes"] = sum(
+                i["size_bytes"] for i in remaining if i["category"] == "espaco_recuperavel"
+            )
+            app.state.cached_scan["folder_cards"] = _build_folder_cards(cfg, remaining, {})
+
+        res["scan"] = _enrich_scan(app.state.cached_scan or scan_all(cfg, db))
         return res
 
     @app.post("/api/undo")
@@ -95,9 +121,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if target_id is None:
             last = db.get_last_undoable_batch()
             if not last:
-                return {"undone_count": 0, "skipped_count": 0, "details": [], "message": "Nenhuma ação pendente para desfazer"}
+                return {
+                    "undone_count": 0,
+                    "skipped_count": 0,
+                    "details": [],
+                    "message": "Nenhuma ação pendente para desfazer",
+                    "scan": _get_or_refresh_scan(force=False),
+                }
             target_id = int(last["id"])
-        return undo_batch(target_id, db)
+        res = undo_batch(target_id, db)
+        res["scan"] = _get_or_refresh_scan(force=True)
+        return res
 
     @app.get("/api/rules")
     def api_list_rules() -> list[dict]:
@@ -106,12 +140,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.post("/api/rules")
     def api_upsert_rule(payload: RulePayload) -> dict[str, Any]:
         rule_id = db.upsert_rule(payload.model_dump())
-        return {"id": rule_id, "rules": db.list_rules()}
+        return {"id": rule_id, "rules": db.list_rules(), "scan": _get_or_refresh_scan(force=True)}
 
     @app.delete("/api/rules/{rule_id}")
     def api_delete_rule(rule_id: int) -> dict[str, Any]:
         db.delete_rule(rule_id)
-        return {"deleted": rule_id, "rules": db.list_rules()}
+        return {"deleted": rule_id, "rules": db.list_rules(), "scan": _get_or_refresh_scan(force=True)}
 
     @app.get("/api/history")
     def api_history() -> list[dict]:
@@ -136,4 +170,3 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return {"opened": str(target)}
 
     return app
-

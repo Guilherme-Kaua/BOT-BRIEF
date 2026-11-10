@@ -54,3 +54,22 @@ def test_database_seeds_default_rules_and_tracks_batches(tmp_path: Path):
     db.mark_batch_undone(batch_id)
     assert db.get_last_undoable_batch() is None
 
+
+def test_get_last_undoable_batch_skips_trash_only_batches(tmp_path: Path):
+    db = Database(tmp_path / "undo_trash.db")
+    db.init_db()
+
+    move_batch_id = db.record_batch(
+        "Mover PDF",
+        [{"action_type": "move", "source_path": "C:/a.pdf", "target_path": "F:/Vida/a.pdf", "meta_json": "{}"}],
+    )
+    _trash_batch_id = db.record_batch(
+        "Lixeira Instalador",
+        [{"action_type": "trash", "source_path": "C:/setup.exe", "target_path": "RecycleBin", "meta_json": "{}"}],
+    )
+
+    last_undoable = db.get_last_undoable_batch()
+    assert last_undoable is not None
+    assert last_undoable["id"] == move_batch_id
+
+

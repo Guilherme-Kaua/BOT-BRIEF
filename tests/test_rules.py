@@ -69,3 +69,12 @@ def test_suggest_clean_name_ignores_numeric_pdfs_and_matches_underscores(tmp_pat
     assert "01_Faculdade" in matched["target_subpath"]
 
 
+def test_suggest_clean_name_handles_dotted_hex_hash_and_uuid(tmp_path: Path):
+    dotted_hash = tmp_path / "6023d9113801011.602ed308c3193.webp"
+    dotted_hash.write_text("img")
+    cleaned = suggest_clean_name(dotted_hash)
+    assert cleaned is not None
+    assert cleaned.startswith("Img_") and cleaned.endswith("_6023d9.webp")
+
+
+

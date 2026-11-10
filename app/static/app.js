@@ -30,14 +30,19 @@ function showToast(msg) {
   setTimeout(() => el.classList.add("hidden"), 4500);
 }
 
-async function fetchScan() {
-  const res = await fetch("/api/scan");
-  currentScan = await res.json();
+async function fetchScan(force = false) {
+  const res = await fetch(force ? "/api/scan?force=1" : "/api/scan");
+  const data = await res.json();
+  applyScanPayload(data);
+}
+
+function applyScanPayload(data) {
+  currentScan = data;
   renderHeader();
   renderHealthCards();
   renderQueue();
-  await fetchRules();
-  await fetchHistory();
+  if (data.rules) renderRules(data.rules);
+  if (data.history) renderHistory(data.history);
 }
 
 function renderHeader() {
@@ -169,7 +174,8 @@ async function executeItem(itemId, includeTrash, recoverableMode) {
   });
   const data = await res.json();
   showToast(`Executado: ${data.executed_count} item(ns) organizado(s).`);
-  await fetchScan();
+  if (data.scan) applyScanPayload(data.scan);
+  else await fetchScan(true);
 }
 
 async function executeCategories(categories, includeTrash = false, recoverableMode = "archive") {
@@ -184,7 +190,8 @@ async function executeCategories(categories, includeTrash = false, recoverableMo
   });
   const data = await res.json();
   showToast(`Organização concluída: ${data.executed_count} item(ns) processado(s)!`);
-  await fetchScan();
+  if (data.scan) applyScanPayload(data.scan);
+  else await fetchScan(true);
 }
 
 async function openInExplorer(pathStr) {
@@ -198,6 +205,10 @@ async function openInExplorer(pathStr) {
 async function fetchRules() {
   const res = await fetch("/api/rules");
   const rules = await res.json();
+  renderRules(rules);
+}
+
+function renderRules(rules) {
   const container = document.getElementById("rules-list");
   container.innerHTML = "";
 
@@ -239,6 +250,10 @@ async function deleteRule(id) {
 async function fetchHistory() {
   const res = await fetch("/api/history");
   const batches = await res.json();
+  renderHistory(batches);
+}
+
+function renderHistory(batches) {
   const container = document.getElementById("history-list");
   container.innerHTML = "";
 
@@ -272,11 +287,12 @@ async function undoSpecificBatch(batchId) {
   });
   const data = await res.json();
   showToast(`Desfeito: ${data.undone_count} item(ns) restaurado(s) ao local original.`);
-  await fetchScan();
+  if (data.scan) applyScanPayload(data.scan);
+  else await fetchScan(true);
 }
 
 // Event Listeners
-document.getElementById("btn-refresh").addEventListener("click", fetchScan);
+document.getElementById("btn-refresh").addEventListener("click", () => fetchScan(true));
 
 document.getElementById("btn-organize-all").addEventListener("click", () => {
   executeCategories(["pronto_para_mover", "renomear_sugerido", "icone_pendente"], false);
