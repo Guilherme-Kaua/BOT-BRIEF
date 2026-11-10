@@ -4,6 +4,8 @@ import socket
 import sys
 import threading
 import time
+import traceback
+from pathlib import Path
 import uvicorn
 from app.api.routes import create_app
 from app.config import AppConfig
@@ -86,4 +88,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log_path = Path(__file__).resolve().parent.parent / "data" / "crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n--- Crash at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write(traceback.format_exc())
+        raise
