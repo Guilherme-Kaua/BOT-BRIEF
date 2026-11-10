@@ -224,9 +224,11 @@ def launch_desktop_app(config: AppConfig | None = None) -> None:
     # Left Panel: Queue
     left_panel = ctk.CTkFrame(main_split, fg_color="#151f32", corner_radius=10)
     left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    left_panel.grid_columnconfigure(0, weight=1)
+    left_panel.grid_rowconfigure(2, weight=1)
 
     tabs_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
-    tabs_frame.pack(fill="x", padx=12, pady=(12, 6))
+    tabs_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
 
     rec_batch_frame = ctk.CTkFrame(left_panel, fg_color="#451a03", corner_radius=8)
 
@@ -268,7 +270,7 @@ def launch_desktop_app(config: AppConfig | None = None) -> None:
     ).pack(side="right", padx=6, pady=6)
 
     queue_scroll = ctk.CTkScrollableFrame(left_panel, fg_color="#0f172a", corner_radius=8)
-    queue_scroll.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+    queue_scroll.grid(row=2, column=0, sticky="nsew", padx=12, pady=(4, 12))
 
     # Right Panel: Visual Rules & History
     right_panel = ctk.CTkFrame(main_split, fg_color="#151f32", corner_radius=10)
@@ -400,9 +402,9 @@ def launch_desktop_app(config: AppConfig | None = None) -> None:
 
         has_rec = any(i["category"] == "espaco_recuperavel" for i in items)
         if has_rec and f_val in {"all", "espaco_recuperavel"}:
-            rec_batch_frame.pack(fill="x", padx=12, pady=(0, 6), before=queue_scroll)
+            rec_batch_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
         else:
-            rec_batch_frame.pack_forget()
+            rec_batch_frame.grid_forget()
 
         if not items:
             ctk.CTkLabel(
@@ -547,4 +549,9 @@ def launch_desktop_app(config: AppConfig | None = None) -> None:
                 )
 
     render_all()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(250, lambda: root.attributes("-topmost", False))
+    root.focus_force()
     root.mainloop()
+

@@ -140,6 +140,34 @@ def test_desktop_gui_controller_instant_execute_and_undo(tmp_path: Path):
     assert pdf.exists()
 
 
+def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypatch):
+    import customtkinter as ctk
+    from app.desktop_gui import launch_desktop_app
+
+    dl = tmp_path / "Downloads"
+    vida = tmp_path / "Vida"
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+    dl.mkdir()
+
+    # Create a recoverable installer (.exe) so rec_batch_frame is packed on startup
+    installer = dl / "DiscordSetup.exe"
+    installer.write_bytes(b"MZ-fake-installer")
+
+    cfg = AppConfig(
+        downloads_dir=dl,
+        desktop_dir=tmp_path / "Desktop",
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "desktop_ui.db",
+    )
+
+    monkeypatch.setattr(ctk.CTk, "mainloop", lambda self: self.destroy())
+    launch_desktop_app(cfg)
+
+
+
 
 
 

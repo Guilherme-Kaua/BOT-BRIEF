@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -25,8 +26,11 @@ def create_tray_icon_image() -> Image.Image:
 def open_dashboard_window(url: str) -> None:
     if os.name == "nt":
         try:
+            py_exe = Path(sys.executable)
+            pythonw = py_exe.with_name("pythonw.exe")
+            runner = str(pythonw if pythonw.exists() else py_exe)
             subprocess.Popen(
-                ["pythonw", "-m", "app.main", "--desktop-only"],
+                [runner, "-m", "app.main", "--desktop-only"],
                 cwd=str(Path(__file__).resolve().parent.parent.parent),
             )
             return

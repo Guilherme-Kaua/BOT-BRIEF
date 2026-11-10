@@ -18,10 +18,14 @@ def ensure_stdio_streams() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
-def _find_free_port(preferred: int) -> int:
+def _is_port_in_use(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(("127.0.0.1", preferred)) != 0:
-            return preferred
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _find_free_port(preferred: int) -> int:
+    if not _is_port_in_use(preferred):
+        return preferred
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
@@ -48,7 +52,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18420, help="Porta local do painel (padrão: 18420)")
     args = parser.parse_args()
 
-    if args.desktop_only:
+    if args.desktop_only or (args.open and _is_port_in_use(args.port)):
         from app.desktop_gui import launch_desktop_app
 
         launch_desktop_app(AppConfig(port=args.port))
