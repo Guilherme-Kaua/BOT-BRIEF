@@ -13,14 +13,50 @@ from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.scanner import scan_all
 
 
-def create_tray_icon_image() -> Image.Image:
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+def create_tray_icon_image(size: int = 256) -> Image.Image:
+    # Draw at 512x512 and downsample with LANCZOS for crisp anti-aliased edges
+    canvas_sz = 512
+    img = Image.new("RGBA", (canvas_sz, canvas_sz), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Folder shape in vibrant blue + green status badge
-    draw.rounded_rectangle((6, 16, 58, 52), radius=8, fill=(37, 99, 235, 255))
-    draw.rounded_rectangle((6, 10, 28, 22), radius=4, fill=(59, 130, 246, 255))
-    draw.ellipse((42, 38, 60, 56), fill=(34, 197, 94, 255))
+
+    # 1. Outer dark squircle badge
+    draw.rounded_rectangle((16, 16, 496, 496), radius=110, fill=(15, 23, 42, 255), outline=(51, 65, 85, 255), width=8)
+
+    # 2. Folder back tab & back cover (Deep Royal Blue)
+    draw.rounded_rectangle((68, 96, 240, 180), radius=28, fill=(29, 78, 216, 255))
+    draw.rounded_rectangle((68, 132, 444, 412), radius=42, fill=(30, 64, 175, 255))
+
+    # 3. Three Folcolor category cards peeking inside the folder (Orange, Green, Cyan)
+    draw.rounded_rectangle((100, 152, 210, 250), radius=16, fill=(249, 115, 22, 255))
+    draw.rounded_rectangle((195, 142, 315, 250), radius=16, fill=(16, 185, 129, 255))
+    draw.rounded_rectangle((295, 152, 412, 250), radius=16, fill=(14, 165, 233, 255))
+
+    # 4. Folder front pocket (Electric Blue + light top rim)
+    draw.rounded_rectangle((68, 196, 444, 416), radius=42, fill=(37, 99, 235, 255), outline=(96, 165, 250, 255), width=6)
+    draw.line((104, 226, 408, 226), fill=(147, 197, 253, 190), width=10)
+
+    # 5. Glowing "APP LIGADO" Neon Green Status Badge (Bottom-Right)
+    draw.ellipse((308, 308, 484, 484), fill=(11, 15, 25, 255))
+    draw.ellipse((322, 322, 470, 470), fill=(34, 197, 94, 255), outline=(134, 239, 172, 255), width=8)
+    # Crisp white checkmark inside the green ON badge
+    draw.line([(360, 398), (386, 426), (436, 368)], fill=(255, 255, 255, 255), width=20, joint="curve")
+
+    if size != canvas_sz:
+        return img.resize((size, size), Image.Resampling.LANCZOS)
     return img
+
+
+def ensure_app_icon_ico() -> Path:
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    ico_path = static_dir / "vida_organizer.ico"
+    master = create_tray_icon_image(size=256)
+    master.save(
+        str(ico_path),
+        format="ICO",
+        sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)],
+    )
+    return ico_path
 
 
 def open_dashboard_window(url: str) -> None:

@@ -194,6 +194,15 @@ def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypa
     win.ctrl.ignore_items([first_id])
     assert all(i["id"] != first_id for i in win.ctrl.state["queue"])
     assert len(win.ctrl.state["ignored_paths"]) == 1
+
+    # 6. Custom App Icon ("App Ligado") is generated as .ico and set on window
+    from app.tray.tray_agent import ensure_app_icon_ico
+
+    ico_path = ensure_app_icon_ico()
+    assert ico_path.exists()
+    assert ico_path.suffix == ".ico"
+    assert ico_path.stat().st_size > 1000
+    assert not win.windowIcon().isNull()
     win.close()
 
 

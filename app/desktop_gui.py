@@ -10,6 +10,7 @@ from app.db import Database
 from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.folcolor import apply_folcolor_icon, build_vida_tree
 from app.engine.scanner import _build_folder_cards, scan_all
+from app.tray.tray_agent import ensure_app_icon_ico
 
 FOLCOLOR_PALETTE: list[tuple[int, str, str]] = [
     (2, "Vermelho Vibrante (Inbox / Urgente)", "#ef4444"),
@@ -552,6 +553,15 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self.setWindowTitle(f"Vida Organizer — Central {self.ctrl.config.vida_root} (GPU Desktop)")
             self.resize(1440, 880)
             self.setStyleSheet(DARK_FLUENT_QSS)
+            try:
+                ico_file = ensure_app_icon_ico()
+                app_icon = QtGui.QIcon(str(ico_file))
+                self.setWindowIcon(app_icon)
+                qapp_inst = QtWidgets.QApplication.instance()
+                if qapp_inst is not None:
+                    qapp_inst.setWindowIcon(app_icon)
+            except Exception:
+                pass
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -1657,12 +1667,24 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
 
 def launch_desktop_app(config: AppConfig | None = None) -> None:
+    import ctypes
     from PySide6 import QtCore, QtGui, QtWidgets
+
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("VidaOrganizer.BotBrief.Desktop.1")
+        except Exception:
+            pass
 
     QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    try:
+        ico_file = ensure_app_icon_ico()
+        app.setWindowIcon(QtGui.QIcon(str(ico_file)))
+    except Exception:
+        pass
     win = create_desktop_window(config, auto_scan_async=True)
     win.show()
     win.raise_()
