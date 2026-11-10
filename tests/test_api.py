@@ -58,3 +58,18 @@ def test_app_js_and_open_folder_escaping():
     assert 'f"/select,{p}"' in routes_py
 
 
+def test_windowless_pythonw_uvicorn_config_does_not_crash(monkeypatch):
+    import sys
+    import uvicorn
+    from app.main import ensure_stdio_streams
+
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    ensure_stdio_streams()
+    cfg = uvicorn.Config("app.api.routes:create_app", host="127.0.0.1", port=18420, log_config=None)
+    cfg.configure_logging()
+    assert sys.stdout is not None
+    assert sys.stderr is not None
+
+
+

@@ -1,5 +1,7 @@
 import argparse
+import os
 import socket
+import sys
 import threading
 import time
 import uvicorn
@@ -7,6 +9,13 @@ from app.api.routes import create_app
 from app.config import AppConfig
 from app.db import Database
 from app.tray.tray_agent import TrayAgent, open_dashboard_window
+
+
+def ensure_stdio_streams() -> None:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
 def _find_free_port(preferred: int) -> int:
@@ -18,7 +27,20 @@ def _find_free_port(preferred: int) -> int:
         return int(s.getsockname()[1])
 
 
+def _wait_and_open(port: int, url: str, timeout_sec: float = 10.0) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                open_dashboard_window(url)
+                return
+        time.sleep(0.15)
+    open_dashboard_window(url)
+
+
 def main() -> None:
+    ensure_stdio_streams()
+
     parser = argparse.ArgumentParser(description="Vida Organizer — BOT-BRIEF")
     parser.add_argument("--no-tray", action="store_true", help="Roda apenas o servidor web sem ícone na bandeja")
     parser.add_argument("--open", action="store_true", help="Abre o painel visual ao iniciar")
@@ -35,18 +57,18 @@ def main() -> None:
 
     if args.no_tray:
         if args.open:
-            threading.Timer(1.0, lambda: open_dashboard_window(url)).start()
-        uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="info")
+            threading.Thread(target=_wait_and_open, args=(port, url), daemon=True).start()
+        uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_config=None)
         return
 
     server_thread = threading.Thread(
-        target=lambda: uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="warning"),
+        target=lambda: uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_config=None),
         daemon=True,
     )
     server_thread.start()
 
     if args.open:
-        threading.Timer(1.0, lambda: open_dashboard_window(url)).start()
+        threading.Thread(target=_wait_and_open, args=(port, url), daemon=True).start()
 
     tray = TrayAgent(config=config, db=db, dashboard_url=url, fastapi_app=fastapi_app)
     tray.start()
@@ -54,4 +76,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
