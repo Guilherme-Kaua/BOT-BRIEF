@@ -110,3 +110,66 @@ def test_scan_all_classifies_downloads_and_vida_roots(tmp_path: Path):
     assert "icone_pendente" in categories
     assert report["summary"]["recoverable_bytes"] >= 2048
 
+
+def test_scanner_triages_99_inbox_downloads_empty_dirs_abandoned_parts_and_ignored_paths(tmp_path: Path):
+    import os
+    import time
+
+    dl = tmp_path / "Downloads"
+    vida = tmp_path / "Vida"
+    inbox_dl = vida / "99_Inbox" / "Downloads"
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+    (vida / "03_Recursos" / "01_Biblioteca_Tech" / "Ferramentas").mkdir(parents=True)
+    (vida / "01_Projetos" / "Projeto_Nova_pasta").mkdir(parents=True)
+    (vida / "00_Jogos").mkdir(parents=True)
+    inbox_dl.mkdir(parents=True)
+    dl.mkdir()
+
+    # 1. Items sitting inside 99_Inbox/Downloads
+    waz = inbox_dl / "Raul Sidnei Wazlawick.pdf"
+    waz.write_bytes(b"book")
+    fira_dir = inbox_dl / "FiraCode"
+    fira_dir.mkdir()
+    (fira_dir / "FiraCode-Regular.ttf").write_bytes(b"font")
+
+    # 2. Abandoned .part file (> 48 hours old)
+    old_part = inbox_dl / "abandoned.htm.part"
+    old_part.write_bytes(b"partial")
+    old_ts = time.time() - (48 * 3600)
+    os.utime(old_part, (old_ts, old_ts))
+
+    # 3. Loose files in category roots
+    loose_md = vida / "01_Projetos" / "daily-summary.md"
+    loose_md.write_bytes(b"# summary")
+    loose_txt = vida / "00_Jogos" / "teste.txt"
+    loose_txt.write_bytes(b"oi")
+
+    # 4. Ignored file in Downloads
+    pinned = dl / "AlumiGest_NaoMover.pdf"
+    pinned.write_bytes(b"keep-here")
+
+    cfg = AppConfig(
+        downloads_dir=dl,
+        desktop_dir=tmp_path / "Desktop",
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "deep.db",
+    )
+    db = Database(cfg.db_path)
+    db.init_db()
+    db.add_ignored_path(str(pinned), "Fixado no local")
+
+    report = scan_all(cfg, db)
+    by_src = {Path(i["source_path"]): i for i in report["queue"]}
+
+    assert waz in by_src and "01_Faculdade" in by_src[waz]["target_path"]
+    assert fira_dir in by_src and "Ferramentas" in by_src[fira_dir]["target_path"]
+    assert old_part in by_src and by_src[old_part]["category"] == "espaco_recuperavel"
+    assert (vida / "01_Projetos" / "Projeto_Nova_pasta") in by_src
+    assert loose_md in by_src and "Prompts_e_Docs" in by_src[loose_md]["target_path"]
+    assert loose_txt in by_src and "Outros_Arquivos" in by_src[loose_txt]["target_path"]
+    assert pinned not in by_src
+
+

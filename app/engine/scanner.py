@@ -5,11 +5,12 @@ from pathlib import Path
 from app.config import AppConfig, FOLCOLOR_CATEGORY_MAP
 from app.db import Database
 from app.engine.duplicates import (
+    find_abandoned_partials_and_empty_dirs,
     find_duplicates_and_revisions,
     find_installers,
     find_redundant_archives,
 )
-from app.engine.folcolor import scan_missing_icons
+from app.engine.folcolor import build_vida_tree, scan_missing_icons
 from app.engine.protector import is_active_download, is_protected_path
 from app.engine.rules import (
     evaluate_file,
@@ -26,26 +27,43 @@ def _item_id(category: str, source_path: str) -> str:
 def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> dict:
     current_ts = now_ts if now_ts is not None else time.time()
     rules = db.list_rules()
+    ignored_set = db.get_ignored_set()
     queue: list[dict] = []
     seen_sources: set[str] = set()
 
-    # 1. Recoverable space items in Downloads and Vida category roots
+    # 1. Recoverable space items in Downloads, 99_Inbox/Downloads and Vida category roots
+    inbox_dl = config.vida_root / "99_Inbox" / "Downloads"
     vida_cat_dirs = [
         config.vida_root / cat
         for cat in FOLCOLOR_CATEGORY_MAP
         if (config.vida_root / cat).exists()
     ]
     scan_dirs = [config.downloads_dir, *vida_cat_dirs]
+    if inbox_dl.exists():
+        scan_dirs.append(inbox_dl)
 
+    empty_and_part_dirs = [
+        config.downloads_dir,
+        inbox_dl,
+        config.vida_root / "99_Inbox",
+        config.vida_root / "01_Projetos",
+    ]
     recoverable_items = (
         find_redundant_archives(config.downloads_dir)
+        + (find_redundant_archives(inbox_dl) if inbox_dl.exists() else [])
         + find_installers(config.downloads_dir)
+        + (find_installers(inbox_dl) if inbox_dl.exists() else [])
         + find_duplicates_and_revisions(scan_dirs, prefer_keep_root=config.vida_root)
+        + find_abandoned_partials_and_empty_dirs(
+            empty_and_part_dirs,
+            now_ts=current_ts,
+            skip_dirs={str(inbox_dl), str(config.vida_root / "99_Inbox" / "Capturas")},
+        )
     )
 
     for rec in recoverable_items:
         sp = rec["source_path"]
-        if sp in seen_sources:
+        if sp in seen_sources or str(Path(sp)).lower() in ignored_set:
             continue
         seen_sources.add(sp)
         queue.append(
@@ -58,17 +76,20 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
                 "reason": rec["reason"],
                 "size_bytes": int(rec.get("size_bytes", 0)),
                 "cooldown_ready": False,
-                "rule_name": "Limpeza de Espaço (Instaladores / Duplicados / Zips)",
+                "rule_name": "Limpeza de Espaço (Instaladores / Duplicados / Vazios)",
                 "folcolor_index": 15,
+                "subtype": rec.get("subtype", ""),
             }
         )
 
-    # 2. Scan Downloads, Desktop, Documents & Vida category roots for routing rules & clean renames
+    # 2. Scan Downloads, Desktop, Documents, 99_Inbox/Downloads & Vida category roots
     scope_dirs: list[tuple[str, Path, int]] = [
         ("Downloads", config.downloads_dir, config.downloads_cooldown_minutes),
         ("Desktop", config.desktop_dir, config.downloads_cooldown_minutes),
         ("Documents", config.documents_dir, config.downloads_cooldown_minutes),
     ]
+    if inbox_dl.exists():
+        scope_dirs.append(("99_Inbox", inbox_dl, config.vida_root_cooldown_minutes))
     for cat in FOLCOLOR_CATEGORY_MAP:
         cat_path = config.vida_root / cat
         if cat_path.exists():
@@ -87,7 +108,9 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
         for entry in entries:
             if entry.name.lower() in {"desktop.ini", ".directory"} or entry.name.startswith("."):
                 continue
-            if is_active_download(entry) or is_protected_path(entry, config.projetos_dir):
+            if str(entry).lower() in ignored_set:
+                continue
+            if is_active_download(entry, now_ts=current_ts) or is_protected_path(entry, config.projetos_dir):
                 continue
 
             sp = str(entry)
@@ -114,8 +137,8 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
                         }
                     )
                     continue
-                # Only evaluate top-level folders in Downloads (like ghidra, SDIO), never category subfolders in Vida
-                if scope_name != "Downloads":
+                # Evaluate top-level folders in Downloads and 99_Inbox/Downloads, never category subfolders in Vida
+                if scope_name != "Downloads" and directory != inbox_dl:
                     continue
 
             clean_name = suggest_clean_name(entry) if entry.is_file() else None
@@ -160,12 +183,17 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
                 )
             elif clean_name:
                 seen_sources.add(sp)
+                dest_parent = (
+                    config.vida_root / scope_name / "Outros_Arquivos"
+                    if scope_name in FOLCOLOR_CATEGORY_MAP and scope_name != "99_Inbox"
+                    else entry.parent
+                )
                 queue.append(
                     {
                         "id": _item_id("renomear_sugerido", sp),
                         "category": "renomear_sugerido",
                         "source_path": sp,
-                        "target_path": str(entry.parent / clean_name),
+                        "target_path": str(dest_parent / clean_name),
                         "suggested_name": clean_name,
                         "reason": f"Nome ilegível → sugerido '{clean_name}'",
                         "size_bytes": size_bytes,
@@ -174,11 +202,30 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
                         "folcolor_index": FOLCOLOR_CATEGORY_MAP.get(scope_name, 8),
                     }
                 )
+            elif entry.is_file() and scope_name in FOLCOLOR_CATEGORY_MAP and scope_name != "99_Inbox":
+                seen_sources.add(sp)
+                dest_sub = config.vida_root / scope_name / "Outros_Arquivos" / entry.name
+                queue.append(
+                    {
+                        "id": _item_id("pronto_para_mover", sp),
+                        "category": "pronto_para_mover",
+                        "source_path": sp,
+                        "target_path": str(dest_sub),
+                        "suggested_name": None,
+                        "reason": f"Arquivo solto na raiz de {scope_name} → subpasta Outros_Arquivos",
+                        "size_bytes": size_bytes,
+                        "cooldown_ready": False,
+                        "rule_name": f"Organização de Raiz ({scope_name})",
+                        "folcolor_index": FOLCOLOR_CATEGORY_MAP.get(scope_name, 13),
+                    }
+                )
 
     # 3. Missing Folcolor icons inside F:\Vida
     missing_icons = scan_missing_icons(config.vida_root, config.folcolor_exe, max_depth=2)
     for icon_item in missing_icons:
         sp = icon_item["path"]
+        if sp in seen_sources or str(Path(sp)).lower() in ignored_set:
+            continue
         queue.append(
             {
                 "id": _item_id("icone_pendente", sp),
@@ -219,6 +266,8 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
         },
         "folder_cards": folder_cards,
         "queue": queue,
+        "vida_tree": build_vida_tree(config.vida_root, config.folcolor_exe, queue),
+        "ignored_paths": db.list_ignored_paths(),
     }
 
 

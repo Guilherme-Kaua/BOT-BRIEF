@@ -26,7 +26,7 @@ UNSTANDARDIZED_FOLDER_PATTERNS = [
 ]
 
 
-MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4"}
+MEDIA_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".ico", ".svg"}
 
 
 def normalize_text(text: str) -> str:

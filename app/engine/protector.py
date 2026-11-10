@@ -1,6 +1,7 @@
 from functools import lru_cache
 import os
 from pathlib import Path
+import time
 
 PROTECTED_MARKER_ENTRIES: set[str] = {
     ".git",
@@ -74,9 +75,19 @@ def is_protected_path(path: Path, projetos_dir: Path | None = None) -> bool:
     return False
 
 
-def is_active_download(path: Path) -> bool:
+def is_active_download(path: Path, now_ts: float | None = None, max_active_hours: float = 24.0) -> bool:
     p = Path(path)
-    return p.suffix.lower() in ACTIVE_DOWNLOAD_SUFFIXES
+    if p.suffix.lower() not in ACTIVE_DOWNLOAD_SUFFIXES:
+        return False
+    if p.exists():
+        try:
+            cur = now_ts if now_ts is not None else time.time()
+            age_hours = (cur - p.stat().st_mtime) / 3600.0
+            if age_hours > max_active_hours:
+                return False
+        except OSError:
+            pass
+    return True
 
 
 def is_file_locked(path: Path) -> bool:

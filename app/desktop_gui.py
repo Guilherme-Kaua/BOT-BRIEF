@@ -8,7 +8,7 @@ from typing import Any
 from app.config import AppConfig
 from app.db import Database
 from app.engine.executor import execute_queue_items, undo_batch
-from app.engine.folcolor import apply_folcolor_icon
+from app.engine.folcolor import apply_folcolor_icon, build_vida_tree
 from app.engine.scanner import _build_folder_cards, scan_all
 
 FOLCOLOR_PALETTE: list[tuple[int, str, str]] = [
@@ -59,6 +59,12 @@ class DesktopController:
         self.state["last_undoable_batch"] = self.db.get_last_undoable_batch()
         self.state["rules"] = self.db.list_rules()
         self.state["history"] = self.db.list_batches(limit=25)
+        self.state["ignored_paths"] = self.db.list_ignored_paths()
+        self.state["vida_tree"] = build_vida_tree(
+            self.config.vida_root,
+            self.config.folcolor_exe,
+            self.state.get("queue", []),
+        )
         return self.state
 
     def update_item_target(
@@ -78,8 +84,66 @@ class DesktopController:
                     item["category"] = "pronto_para_mover"
                 item["reason"] = f"Destino personalizado → {Path(new_target_path).name}"
                 item["rule_name"] = "Edição Manual"
+                self.state["vida_tree"] = build_vida_tree(
+                    self.config.vida_root,
+                    self.config.folcolor_exe,
+                    self.state.get("queue", []),
+                )
                 return item
         return None
+
+    def ignore_items(self, item_ids: list[str], reason: str = "Fixado pelo usuário no local atual") -> int:
+        if not self.state:
+            self.refresh(force=True)
+        wanted = set(item_ids)
+        count = 0
+        remaining: list[dict[str, Any]] = []
+        for item in self.state.get("queue", []):
+            if item["id"] in wanted:
+                self.db.add_ignored_path(item["source_path"], reason)
+                count += 1
+            else:
+                remaining.append(item)
+        self.state["queue"] = remaining
+        self.state["summary"]["total_disorganized"] = len(remaining)
+        self.state["summary"]["recoverable_bytes"] = sum(
+            i["size_bytes"] for i in remaining if i["category"] == "espaco_recuperavel"
+        )
+        self.state["folder_cards"] = _build_folder_cards(self.config, remaining, {})
+        self.state["ignored_paths"] = self.db.list_ignored_paths()
+        self.state["vida_tree"] = build_vida_tree(
+            self.config.vida_root,
+            self.config.folcolor_exe,
+            remaining,
+        )
+        return count
+
+    def unignore_path(self, path_str: str) -> None:
+        self.db.remove_ignored_path(path_str)
+        self.refresh(force=True)
+
+    def apply_folder_folcolor(self, folder_path: str, folcolor_index: int) -> dict[str, Any]:
+        folder = Path(folder_path)
+        folder.mkdir(parents=True, exist_ok=True)
+        icon_res = (
+            f"{self.config.folcolor_exe},{int(folcolor_index)}"
+            if self.config.folcolor_exe.exists()
+            else "C:\\Windows\\System32\\shell32.dll,3"
+        )
+        applied = apply_folcolor_icon(folder, icon_res)
+        self.state["vida_tree"] = build_vida_tree(
+            self.config.vida_root,
+            self.config.folcolor_exe,
+            self.state.get("queue", []),
+        )
+        return applied
+
+    def create_colored_subfolder(self, parent_path: str, name: str, folcolor_index: int) -> str:
+        clean = name.strip().replace("/", "_").replace("\\", "_")
+        target = Path(parent_path) / clean
+        target.mkdir(parents=True, exist_ok=True)
+        self.apply_folder_folcolor(str(target), folcolor_index)
+        return str(target)
 
     def execute_item(
         self,
@@ -156,14 +220,7 @@ class DesktopController:
         rule_id = self.db.upsert_rule(rule_data)
         if apply_icon_now and rule_data.get("target_subpath"):
             target_dir = self.config.vida_root / str(rule_data["target_subpath"])
-            target_dir.mkdir(parents=True, exist_ok=True)
-            idx = int(rule_data.get("folcolor_index", 13))
-            icon_res = (
-                f"{self.config.folcolor_exe},{idx}"
-                if self.config.folcolor_exe.exists()
-                else "C:\\Windows\\System32\\shell32.dll,3"
-            )
-            apply_folcolor_icon(target_dir, icon_res)
+            self.apply_folder_folcolor(str(target_dir), int(rule_data.get("folcolor_index", 13)))
         self.state["rules"] = self.db.list_rules()
         return rule_id
 
@@ -181,6 +238,11 @@ class DesktopController:
                 i["size_bytes"] for i in remaining if i["category"] == "espaco_recuperavel"
             )
             self.state["folder_cards"] = _build_folder_cards(self.config, remaining, {})
+            self.state["vida_tree"] = build_vida_tree(
+                self.config.vida_root,
+                self.config.folcolor_exe,
+                remaining,
+            )
         self.state["last_undoable_batch"] = self.db.get_last_undoable_batch()
         self.state["history"] = self.db.list_batches(limit=25)
 
@@ -263,7 +325,7 @@ QPushButton {
     color: #f8fafc;
     border: 1px solid #334155;
     border-radius: 6px;
-    padding: 6px 13px;
+    padding: 6px 12px;
     font-weight: 600;
     font-size: 12px;
 }
@@ -331,7 +393,7 @@ QLineEdit, QComboBox, QSpinBox {
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
     border: 1px solid #3b82f6;
 }
-QTableWidget {
+QTableWidget, QTreeWidget {
     background-color: #0f172a;
     alternate-background-color: #111827;
     border: 1px solid #1e293b;
@@ -372,6 +434,14 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 
 def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool = True):
     from PySide6 import QtCore, QtGui, QtWidgets
+
+    class SizeSortableItem(QtWidgets.QTableWidgetItem):
+        def __lt__(self, other: QtWidgets.QTableWidgetItem) -> bool:
+            v1 = self.data(QtCore.Qt.ItemDataRole.UserRole)
+            v2 = other.data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+                return v1 < v2
+            return super().__lt__(other)
 
     class ScanWorker(QtCore.QThread):
         finished_scan = QtCore.Signal(dict)
@@ -422,7 +492,6 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             dir_row.addWidget(btn_browse)
             layout.addLayout(dir_row)
 
-            # Quick PARA category buttons
             preset_lbl = QtWidgets.QLabel("Atalhos rápidos do F:\\Vida:")
             preset_lbl.setStyleSheet("color: #94a3b8; font-size: 12px;")
             layout.addWidget(preset_lbl)
@@ -477,10 +546,11 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self.current_category_filter = "all"
             self.current_folder_filter: str | None = None
             self.editing_rule_id: int | None = None
+            self.selected_tree_folder_path: str = str(self.ctrl.config.vida_root)
             self.scan_worker: ScanWorker | None = None
 
             self.setWindowTitle(f"Vida Organizer — Central {self.ctrl.config.vida_root} (GPU Desktop)")
-            self.resize(1400, 860)
+            self.resize(1440, 880)
             self.setStyleSheet(DARK_FLUENT_QSS)
 
             central = QtWidgets.QWidget()
@@ -524,7 +594,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             root_layout.addWidget(header)
 
-            # 2. Health Cards Scroll / Grid Row
+            # 2. Health Cards Row
             self.cards_container = QtWidgets.QWidget()
             self.cards_layout = QtWidgets.QHBoxLayout(self.cards_container)
             self.cards_layout.setContentsMargins(0, 0, 0, 0)
@@ -536,6 +606,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             root_layout.addWidget(self.tabs, 1)
 
             self._build_queue_tab()
+            self._build_vida_tree_tab()
             self._build_rules_tab()
             self._build_history_tab()
 
@@ -545,7 +616,6 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             layout.setContentsMargins(14, 14, 14, 14)
             layout.setSpacing(10)
 
-            # Top filter bar: Category pills + Search input
             top_bar = QtWidgets.QHBoxLayout()
             self.pill_buttons: dict[str, QtWidgets.QPushButton] = {}
             pill_defs = [
@@ -578,9 +648,10 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             layout.addLayout(top_bar)
 
-            # High-performance Table
-            self.table = QtWidgets.QTableWidget(0, 6)
+            # High-performance Table with 7 columns (including sortable Size column)
+            self.table = QtWidgets.QTableWidget(0, 7)
             self.table.setAlternatingRowColors(True)
+            self.table.setSortingEnabled(True)
             self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
             self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
             self.table.verticalHeader().setVisible(False)
@@ -589,6 +660,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                 [
                     "✓",
                     "Arquivo / Pasta",
+                    "Tamanho ⇅",
                     "Origem Atual",
                     "Diagnóstico & Regra",
                     "Destino / Novo Nome (Duplo-clique p/ editar)",
@@ -597,16 +669,18 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             )
             hdr = self.table.horizontalHeader()
             hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
-            self.table.setColumnWidth(0, 42)
+            self.table.setColumnWidth(0, 40)
             hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.table.setColumnWidth(1, 270)
-            hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.table.setColumnWidth(2, 210)
+            self.table.setColumnWidth(1, 240)
+            hdr.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(2, 95)
             hdr.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.table.setColumnWidth(3, 250)
-            hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
-            hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
-            self.table.setColumnWidth(5, 255)
+            self.table.setColumnWidth(3, 190)
+            hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(4, 240)
+            hdr.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            hdr.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(6, 285)
             self.table.cellDoubleClicked.connect(self.on_table_double_clicked)
             self.table.itemChanged.connect(lambda _: self._update_selection_counter())
             layout.addWidget(self.table, 1)
@@ -631,6 +705,11 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             b_layout.addStretch()
 
+            btn_pin_sel = QtWidgets.QPushButton("📌 Fixar/Ignorar Selecionados")
+            btn_pin_sel.setToolTip("Mantém os itens selecionados onde estão e nunca mais sugere movê-los")
+            btn_pin_sel.clicked.connect(self.on_ignore_selected)
+            b_layout.addWidget(btn_pin_sel)
+
             btn_move_custom = QtWidgets.QPushButton("📁 Mover Selecionados Para...")
             btn_move_custom.clicked.connect(self.on_move_selected_to_folder)
             b_layout.addWidget(btn_move_custom)
@@ -653,16 +732,101 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             layout.addWidget(batch_bar)
             self.tabs.addTab(tab, "📋 Fila Inteligente & Seleção em Lote")
 
+        def _build_vida_tree_tab(self):
+            tab = QtWidgets.QWidget()
+            split = QtWidgets.QHBoxLayout(tab)
+            split.setContentsMargins(14, 14, 14, 14)
+            split.setSpacing(14)
+
+            left_col = QtWidgets.QVBoxLayout()
+            left_col.addWidget(
+                QtWidgets.QLabel(
+                    "<b>🌳 Mapa Visual do F:\\Vida (Simulação Antes → Depois & Cores Folcolor em Tempo Real)</b>"
+                )
+            )
+
+            self.vida_tree_widget = QtWidgets.QTreeWidget()
+            self.vida_tree_widget.setAlternatingRowColors(True)
+            self.vida_tree_widget.setHeaderLabels(
+                [
+                    "Pasta no F:\\Vida",
+                    "Cor Folcolor Atual",
+                    "Itens Atuais",
+                    "Simulação (Entrando da Fila)",
+                ]
+            )
+            th = self.vida_tree_widget.header()
+            th.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.vida_tree_widget.setColumnWidth(0, 320)
+            th.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.vida_tree_widget.setColumnWidth(1, 230)
+            th.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.vida_tree_widget.setColumnWidth(2, 110)
+            th.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.vida_tree_widget.itemClicked.connect(self.on_tree_folder_clicked)
+            left_col.addWidget(self.vida_tree_widget, 1)
+            split.addLayout(left_col, 3)
+
+            # Right panel: Quick Folder Color & Subfolder Creator
+            right_card = QtWidgets.QFrame()
+            right_card.setObjectName("SurfaceCard")
+            r_layout = QtWidgets.QVBoxLayout(right_card)
+            r_layout.setContentsMargins(18, 18, 18, 18)
+            r_layout.setSpacing(12)
+
+            lbl_panel = QtWidgets.QLabel("🎨 Ações na Pasta Selecionada")
+            lbl_panel.setStyleSheet("font-size: 15px; font-weight: 700; color: #60a5fa;")
+            r_layout.addWidget(lbl_panel)
+
+            self.lbl_tree_selected_path = QtWidgets.QLabel(f"Pasta: {self.ctrl.config.vida_root}")
+            self.lbl_tree_selected_path.setWordWrap(True)
+            self.lbl_tree_selected_path.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+            r_layout.addWidget(self.lbl_tree_selected_path)
+
+            btn_open_sel_tree = QtWidgets.QPushButton("📂 Abrir Esta Pasta no Windows Explorer")
+            btn_open_sel_tree.clicked.connect(
+                lambda: self.ctrl.open_in_explorer(self.selected_tree_folder_path)
+            )
+            r_layout.addWidget(btn_open_sel_tree)
+
+            r_layout.addWidget(QtWidgets.QLabel("<b>1. Trocar Cor Folcolor da Pasta (Instantâneo):</b>"))
+            self.tree_color_combo = QtWidgets.QComboBox()
+            for idx, label, hex_col in FOLCOLOR_PALETTE:
+                pix = QtGui.QPixmap(16, 16)
+                pix.fill(QtGui.QColor(hex_col))
+                self.tree_color_combo.addItem(QtGui.QIcon(pix), f"#{idx} — {label}", idx)
+            r_layout.addWidget(self.tree_color_combo)
+
+            btn_apply_tree_color = QtWidgets.QPushButton("🎨 Aplicar Cor Folcolor Agora (SHChangeNotify)")
+            btn_apply_tree_color.setObjectName("PurpleBtn")
+            btn_apply_tree_color.clicked.connect(self.on_apply_tree_folder_color)
+            r_layout.addWidget(btn_apply_tree_color)
+
+            r_layout.addSpacing(10)
+            r_layout.addWidget(QtWidgets.QLabel("<b>2. Criar Nova Subpasta Já Colorida Aqui Dentro:</b>"))
+            self.new_subfolder_edit = QtWidgets.QLineEdit()
+            self.new_subfolder_edit.setPlaceholderText("Nome da nova subpasta (ex: 06_Investimentos)")
+            r_layout.addWidget(self.new_subfolder_edit)
+
+            btn_create_sub = QtWidgets.QPushButton("➕ Criar Subpasta Colorida")
+            btn_create_sub.setObjectName("PrimaryBtn")
+            btn_create_sub.clicked.connect(self.on_create_colored_subfolder)
+            r_layout.addWidget(btn_create_sub)
+
+            r_layout.addStretch()
+            split.addWidget(right_card, 2)
+
+            self.tabs.addTab(tab, "🌳 Mapa Visual F:\\Vida (Antes → Depois)")
+
         def _build_rules_tab(self):
             tab = QtWidgets.QWidget()
             split = QtWidgets.QHBoxLayout(tab)
             split.setContentsMargins(14, 14, 14, 14)
             split.setSpacing(14)
 
-            # Left: Rules table
+            # Left: Rules table + Ignored/Pinned files table
             left_col = QtWidgets.QVBoxLayout()
-            lbl_r = QtWidgets.QLabel("<b>🎨 Regras Ativas (Clique em uma regra para editar)</b>")
-            left_col.addWidget(lbl_r)
+            left_col.addWidget(QtWidgets.QLabel("<b>🎨 Regras Ativas (Clique em uma regra para editar)</b>"))
 
             self.rules_table = QtWidgets.QTableWidget(0, 5)
             self.rules_table.setAlternatingRowColors(True)
@@ -677,14 +841,31 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             rh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.rules_table.setColumnWidth(0, 80)
             rh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.rules_table.setColumnWidth(1, 200)
+            self.rules_table.setColumnWidth(1, 190)
             rh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
             rh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
-            self.rules_table.setColumnWidth(3, 220)
+            self.rules_table.setColumnWidth(3, 210)
             rh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.rules_table.setColumnWidth(4, 170)
             self.rules_table.cellClicked.connect(self.on_rule_row_clicked)
-            left_col.addWidget(self.rules_table, 1)
+            left_col.addWidget(self.rules_table, 3)
+
+            left_col.addWidget(
+                QtWidgets.QLabel("<b>📌 Arquivos e Pastas Fixados / Ignorados (Nunca serão movidos)</b>")
+            )
+            self.ignored_table = QtWidgets.QTableWidget(0, 3)
+            self.ignored_table.setAlternatingRowColors(True)
+            self.ignored_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.ignored_table.verticalHeader().setVisible(False)
+            self.ignored_table.verticalHeader().setDefaultSectionSize(36)
+            self.ignored_table.setHorizontalHeaderLabels(["Caminho Protegido", "Motivo", "Ação"])
+            ih = self.ignored_table.horizontalHeader()
+            ih.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            ih.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.ignored_table.setColumnWidth(1, 200)
+            ih.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.ignored_table.setColumnWidth(2, 130)
+            left_col.addWidget(self.ignored_table, 2)
 
             shield_lbl = QtWidgets.QLabel(
                 "🛡️ <b>Trava Intocável Sempre Ativa:</b> pastas com <code>.git</code>, <code>node_modules</code>, "
@@ -786,7 +967,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             form_layout.addLayout(bottom_rule_btns)
             split.addWidget(form_card, 2)
 
-            self.tabs.addTab(tab, "🎨 Editor Visual de Regras & Cores Folcolor")
+            self.tabs.addTab(tab, "🎨 Editor de Regras & Fixados (📌)")
 
         def _build_history_tab(self):
             tab = QtWidgets.QWidget()
@@ -871,7 +1052,9 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self._render_health_cards()
             self._update_pill_counts()
             self._populate_queue_table()
+            self._populate_vida_tree()
             self._populate_rules_table()
+            self._populate_ignored_table()
             self._populate_history_table()
             self.apply_filters()
 
@@ -944,6 +1127,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     self.pill_buttons[k].setText(text)
 
         def _populate_queue_table(self):
+            self.table.setSortingEnabled(False)
             self.table.setUpdatesEnabled(False)
             self.table.blockSignals(True)
             try:
@@ -961,9 +1145,9 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     src = Path(item["source_path"])
                     is_dir = item.get("item_type") == "folder" or src.is_dir()
                     icon_char = "📁" if is_dir else "📄"
-                    sz_str = f" ({format_bytes(item.get('size_bytes', 0))})" if item.get("size_bytes", 0) > 0 else ""
+                    sz_bytes = int(item.get("size_bytes", 0))
 
-                    # Col 0: Checkbox item
+                    # Col 0: Checkbox item storing item["id"]
                     chk_item = QtWidgets.QTableWidgetItem()
                     chk_item.setFlags(
                         QtCore.Qt.ItemFlag.ItemIsUserCheckable
@@ -974,28 +1158,34 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     chk_item.setData(QtCore.Qt.ItemDataRole.UserRole, item["id"])
                     self.table.setItem(row_idx, 0, chk_item)
 
-                    # Col 1: File/Folder name + size
-                    name_item = QtWidgets.QTableWidgetItem(f"{icon_char} {src.name}{sz_str}")
+                    # Col 1: File/Folder name
+                    name_item = QtWidgets.QTableWidgetItem(f"{icon_char} {src.name}")
                     name_item.setToolTip(str(src))
                     font_bold = name_item.font()
                     font_bold.setBold(True)
                     name_item.setFont(font_bold)
                     self.table.setItem(row_idx, 1, name_item)
 
-                    # Col 2: Origin folder
+                    # Col 2: Numeric Sortable Size
+                    sz_item = SizeSortableItem(format_bytes(sz_bytes) if sz_bytes > 0 else "—")
+                    sz_item.setData(QtCore.Qt.ItemDataRole.UserRole, sz_bytes)
+                    sz_item.setForeground(QtGui.QColor("#cbd5e1"))
+                    self.table.setItem(row_idx, 2, sz_item)
+
+                    # Col 3: Origin folder
                     origin_item = QtWidgets.QTableWidgetItem(str(src.parent))
                     origin_item.setForeground(QtGui.QColor("#94a3b8"))
                     origin_item.setToolTip(str(src))
-                    self.table.setItem(row_idx, 2, origin_item)
+                    self.table.setItem(row_idx, 3, origin_item)
 
-                    # Col 3: Category badge + Reason
+                    # Col 4: Category badge + Reason
                     badge_text, badge_color = cat_badges.get(item["category"], (item["category"], "#60a5fa"))
                     diag_item = QtWidgets.QTableWidgetItem(f"{badge_text} · {item.get('reason', '')}")
                     diag_item.setForeground(QtGui.QColor(badge_color))
                     diag_item.setToolTip(item.get("reason", ""))
-                    self.table.setItem(row_idx, 3, diag_item)
+                    self.table.setItem(row_idx, 4, diag_item)
 
-                    # Col 4: Proposed Target / New Name
+                    # Col 5: Proposed Target / New Name
                     target_str = item.get("target_path", "")
                     if target_str == "RecycleBin":
                         disp_target = "🗑️ Lixeira do Windows (ou Arquivar em 04_Arquivo_Morto)"
@@ -1004,9 +1194,9 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     target_item = QtWidgets.QTableWidgetItem(disp_target)
                     target_item.setForeground(QtGui.QColor("#e2e8f0"))
                     target_item.setToolTip("Duplo-clique para editar o nome ou escolher outra pasta de destino")
-                    self.table.setItem(row_idx, 4, target_item)
+                    self.table.setItem(row_idx, 5, target_item)
 
-                    # Col 5: Action buttons widget
+                    # Col 6: Action buttons widget
                     act_widget = QtWidgets.QWidget()
                     act_layout = QtWidgets.QHBoxLayout(act_widget)
                     act_layout.setContentsMargins(4, 2, 4, 2)
@@ -1025,7 +1215,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
                         btn_tr = QtWidgets.QPushButton("🗑️")
                         btn_tr.setObjectName("DangerBtn")
-                        btn_tr.setFixedWidth(34)
+                        btn_tr.setFixedWidth(30)
                         btn_tr.setToolTip("Enviar para a Lixeira do Windows")
                         btn_tr.clicked.connect(
                             lambda checked=False, iid=item_id: self.on_execute_single(iid, True, "trash")
@@ -1041,38 +1231,51 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                         act_layout.addWidget(btn_exec)
 
                     btn_edit = QtWidgets.QPushButton("✏️")
-                    btn_edit.setFixedWidth(34)
+                    btn_edit.setFixedWidth(30)
                     btn_edit.setToolTip("Editar nome do arquivo ou escolher pasta de destino")
-                    btn_edit.clicked.connect(lambda checked=False, r=row_idx: self.open_edit_dialog_for_row(r))
+                    btn_edit.clicked.connect(lambda checked=False, iid=item_id: self.open_edit_dialog_by_id(iid))
                     act_layout.addWidget(btn_edit)
 
+                    btn_pin = QtWidgets.QPushButton("📌")
+                    btn_pin.setFixedWidth(30)
+                    btn_pin.setToolTip("Fixar neste local (Ignorar e nunca mover)")
+                    btn_pin.clicked.connect(lambda checked=False, iid=item_id: self.on_ignore_single(iid))
+                    act_layout.addWidget(btn_pin)
+
                     btn_exp = QtWidgets.QPushButton("📂")
-                    btn_exp.setFixedWidth(34)
+                    btn_exp.setFixedWidth(30)
                     btn_exp.setToolTip("Mostrar no Windows Explorer")
                     btn_exp.clicked.connect(
                         lambda checked=False, p=item["source_path"]: self.ctrl.open_in_explorer(p)
                     )
                     act_layout.addWidget(btn_exp)
 
-                    self.table.setCellWidget(row_idx, 5, act_widget)
+                    self.table.setCellWidget(row_idx, 6, act_widget)
             finally:
                 self.table.blockSignals(False)
                 self.table.setUpdatesEnabled(True)
+                self.table.setSortingEnabled(True)
             self._update_selection_counter()
 
         def apply_filters(self):
-            q = self.ctrl.state.get("queue", [])
+            by_id = {i["id"]: i for i in self.ctrl.state.get("queue", [])}
             query = self.search_input.text().strip().lower()
             cat_filter = self.current_category_filter
             folder_filter = (
-                 str(Path(self.current_folder_filter)).lower() if self.current_folder_filter else None
+                str(Path(self.current_folder_filter)).lower() if self.current_folder_filter else None
             )
 
             self.table.setUpdatesEnabled(False)
             try:
-                for row_idx, item in enumerate(q):
-                    if row_idx >= self.table.rowCount():
-                        break
+                for row_idx in range(self.table.rowCount()):
+                    chk = self.table.item(row_idx, 0)
+                    if not chk:
+                        continue
+                    iid = str(chk.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                    item = by_id.get(iid)
+                    if not item:
+                        self.table.setRowHidden(row_idx, True)
+                        continue
                     visible = True
                     if cat_filter != "all" and item["category"] != cat_filter:
                         visible = False
@@ -1125,14 +1328,16 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self.lbl_selected_count.setText(f"{len(ids)} selecionado(s) ({format_bytes(total_bytes)})")
 
         def on_table_double_clicked(self, row: int, col: int):
-            if col in {1, 4}:
-                self.open_edit_dialog_for_row(row)
+            if col in {1, 5}:
+                chk = self.table.item(row, 0)
+                if chk:
+                    iid = str(chk.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                    self.open_edit_dialog_by_id(iid)
 
-        def open_edit_dialog_for_row(self, row: int):
-            q = self.ctrl.state.get("queue", [])
-            if row < 0 or row >= len(q):
+        def open_edit_dialog_by_id(self, item_id: str):
+            item = next((i for i in self.ctrl.state.get("queue", []) if i["id"] == item_id), None)
+            if not item:
                 return
-            item = q[row]
             dlg = EditItemTargetDialog(self, self.ctrl, item)
             if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
                 new_dst = dlg.result_target_path()
@@ -1143,6 +1348,20 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                 else:
                     self.lbl_status.setText(f"✏️ Destino atualizado na fila: {new_dst}")
                 self.render_all()
+
+        def on_ignore_single(self, item_id: str):
+            cnt = self.ctrl.ignore_items([item_id])
+            self.lbl_status.setText(f"📌 {cnt} item fixado no local atual (adicionado aos ignorados).")
+            self.render_all()
+
+        def on_ignore_selected(self):
+            ids = self.get_selected_item_ids()
+            if not ids:
+                self.lbl_status.setText("⚠️ Marque pelo menos 1 item na coluna [✓] para fixar/ignorar.")
+                return
+            cnt = self.ctrl.ignore_items(ids)
+            self.lbl_status.setText(f"📌 {cnt} item(ns) fixado(s) no local atual.")
+            self.render_all()
 
         def on_execute_single(self, item_id: str, include_trash: bool, mode: str):
             t0 = time.perf_counter()
@@ -1197,7 +1416,79 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self.lbl_status.setText(f"↩ Desfeito: {res['undone_count']} item(ns) restaurado(s) ao local original.")
             self.render_all()
 
-        # --- Rules Tab Logic ---
+        # --- Vida Tree Tab Logic ---
+        def _populate_vida_tree(self):
+            self.vida_tree_widget.clear()
+            nodes = self.ctrl.state.get("vida_tree", [])
+            by_path: dict[str, QtWidgets.QTreeWidgetItem] = {}
+
+            for node in nodes:
+                folder_p = Path(node["path"])
+                c_idx = int(node.get("current_folcolor_index", 13))
+                c_label, c_hex = folcolor_info(c_idx)
+                status_ini = "✓ Ativo" if node.get("has_desktop_ini") else "⏳ Pendente"
+
+                inc = int(node.get("incoming_count", 0))
+                if inc > 0:
+                    preview = ", ".join(node.get("incoming_files", [])[:4])
+                    sim_txt = f"🟢 +{inc} entrando ({preview})"
+                else:
+                    sim_txt = "—"
+
+                tree_item = QtWidgets.QTreeWidgetItem(
+                    [
+                        f"📁 {node['name']}",
+                        f"● #{c_idx} {c_label.split('(')[0].strip()} ({status_ini})",
+                        f"{node['file_count']} item(ns)",
+                        sim_txt,
+                    ]
+                )
+                tree_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, node["path"])
+                tree_item.setData(1, QtCore.Qt.ItemDataRole.UserRole, c_idx)
+                tree_item.setForeground(1, QtGui.QColor(c_hex))
+                if inc > 0:
+                    tree_item.setForeground(3, QtGui.QColor("#10b981"))
+
+                parent_key = str(folder_p.parent).lower()
+                if node["depth"] == 0 or parent_key not in by_path:
+                    self.vida_tree_widget.addTopLevelItem(tree_item)
+                else:
+                    by_path[parent_key].addChild(tree_item)
+                by_path[str(folder_p).lower()] = tree_item
+
+            self.vida_tree_widget.expandAll()
+
+        def on_tree_folder_clicked(self, item: QtWidgets.QTreeWidgetItem, _col: int):
+            p = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            c_idx = item.data(1, QtCore.Qt.ItemDataRole.UserRole)
+            if p:
+                self.selected_tree_folder_path = str(p)
+                self.lbl_tree_selected_path.setText(f"Pasta selecionada:\n{p}")
+            if c_idx is not None:
+                combo_i = self.tree_color_combo.findData(int(c_idx))
+                if combo_i >= 0:
+                    self.tree_color_combo.setCurrentIndex(combo_i)
+
+        def on_apply_tree_folder_color(self):
+            idx = int(self.tree_color_combo.currentData() or 13)
+            self.ctrl.apply_folder_folcolor(self.selected_tree_folder_path, idx)
+            self.lbl_status.setText(
+                f"🎨 Cor Folcolor #{idx} aplicada em {self.selected_tree_folder_path} (Explorer atualizado)!"
+            )
+            self.render_all()
+
+        def on_create_colored_subfolder(self):
+            sub_name = self.new_subfolder_edit.text().strip()
+            if not sub_name:
+                self.lbl_status.setText("⚠️ Digite o nome da nova subpasta antes de criar.")
+                return
+            idx = int(self.tree_color_combo.currentData() or 13)
+            created = self.ctrl.create_colored_subfolder(self.selected_tree_folder_path, sub_name, idx)
+            self.new_subfolder_edit.clear()
+            self.lbl_status.setText(f"➕ Subpasta criada e colorida (#{idx}): {created}")
+            self.render_all()
+
+        # --- Rules & Ignored Tab Logic ---
         def _populate_rules_table(self):
             rules = self.ctrl.state.get("rules", [])
             self.rules_table.setRowCount(len(rules))
@@ -1226,6 +1517,27 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                 c_item = QtWidgets.QTableWidgetItem(f"● #{c_idx} {c_label.split('(')[0].strip()}")
                 c_item.setForeground(QtGui.QColor(c_hex))
                 self.rules_table.setItem(r_idx, 4, c_item)
+
+        def _populate_ignored_table(self):
+            ignored = self.ctrl.state.get("ignored_paths", [])
+            self.ignored_table.setRowCount(len(ignored))
+            for idx, entry in enumerate(ignored):
+                p_str = entry["path"]
+                self.ignored_table.setItem(idx, 0, QtWidgets.QTableWidgetItem(p_str))
+                self.ignored_table.setItem(idx, 1, QtWidgets.QTableWidgetItem(entry.get("reason", "")))
+
+                w = QtWidgets.QWidget()
+                wl = QtWidgets.QHBoxLayout(w)
+                wl.setContentsMargins(4, 2, 4, 2)
+                btn_unpin = QtWidgets.QPushButton("🔓 Desafixar")
+                btn_unpin.clicked.connect(
+                    lambda checked=False, path_val=p_str: (
+                        self.ctrl.unignore_path(path_val),
+                        self.render_all(),
+                    )
+                )
+                wl.addWidget(btn_unpin)
+                self.ignored_table.setCellWidget(idx, 2, w)
 
         def on_rule_row_clicked(self, row: int, _col: int):
             rules = self.ctrl.state.get("rules", [])

@@ -29,7 +29,7 @@ DEFAULT_RULES: list[dict] = [
             "SportHub",
         ],
         "extensions": ["pdf", "docx", "pptx", "xlsx", "txt", "zip", "md"],
-        "source_scopes": ["Downloads", "Desktop", "Documents", "02_Areas", "03_Recursos", "04_Arquivo_Morto"],
+        "source_scopes": ["Downloads", "Desktop", "Documents", "02_Areas", "03_Recursos", "04_Arquivo_Morto", "99_Inbox"],
         "min_age_days": 0,
         "enabled": 1,
     },
@@ -85,14 +85,34 @@ DEFAULT_RULES: list[dict] = [
             "ghidra",
             "SDIO",
             "scrcpy",
+            "QtScrcpy",
             "yt-dlp",
+            "yewtube",
             "FiraCode",
             "SegoeUI",
+            "segoe-ui",
             "OldNewExplorer",
             "ThemeTool",
+            "Spotube",
+            "MPF",
+            "Folcolor",
+            "MangoDisk",
+            "Telegram Desktop",
         ],
-        "extensions": ["zip", "rar", "7z", "exe", "dir"],
+        "extensions": ["zip", "rar", "7z", "exe", "whl", "dir"],
         "source_scopes": ["Downloads", "99_Inbox"],
+        "min_age_days": 0,
+        "enabled": 1,
+    },
+    {
+        "name": "Prompts, Skills & Docs de Projetos",
+        "priority": 45,
+        "category_folder": "01_Projetos",
+        "target_subpath": "01_Projetos/Prompts_e_Docs",
+        "folcolor_index": 6,
+        "keywords": ["summary", "review", "subtask", "prompt", "skill", "readme", "spec", "plan"],
+        "extensions": ["md", "txt"],
+        "source_scopes": ["01_Projetos", "Downloads", "99_Inbox"],
         "min_age_days": 0,
         "enabled": 1,
     },
@@ -192,6 +212,12 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS ignored_paths (
+                    path TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL DEFAULT 'Fixado pelo usuário',
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
@@ -218,6 +244,49 @@ class Database:
                             rule["enabled"],
                         ),
                     )
+            else:
+                # Ensure new default rules or updated default scopes/keywords are present
+                existing = {
+                    r["name"]: r["id"]
+                    for r in conn.execute("SELECT id, name FROM rules").fetchall()
+                }
+                for rule in DEFAULT_RULES:
+                    if rule["name"] not in existing:
+                        conn.execute(
+                            """
+                            INSERT INTO rules (
+                                name, priority, category_folder, target_subpath,
+                                folcolor_index, keywords_json, extensions_json,
+                                source_scopes_json, min_age_days, enabled
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                rule["name"],
+                                rule["priority"],
+                                rule["category_folder"],
+                                rule["target_subpath"],
+                                rule["folcolor_index"],
+                                json.dumps(rule["keywords"], ensure_ascii=False),
+                                json.dumps(rule["extensions"], ensure_ascii=False),
+                                json.dumps(rule["source_scopes"], ensure_ascii=False),
+                                rule["min_age_days"],
+                                rule["enabled"],
+                            ),
+                        )
+                    elif rule["name"] in {"Faculdade & ADS", "Ferramentas Tech & Reverse Engineering"}:
+                        conn.execute(
+                            """
+                            UPDATE rules
+                            SET keywords_json = ?, extensions_json = ?, source_scopes_json = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                json.dumps(rule["keywords"], ensure_ascii=False),
+                                json.dumps(rule["extensions"], ensure_ascii=False),
+                                json.dumps(rule["source_scopes"], ensure_ascii=False),
+                                int(existing[rule["name"]]),
+                            ),
+                        )
             conn.commit()
 
     def _row_to_rule(self, row: sqlite3.Row) -> dict:
@@ -290,6 +359,35 @@ class Database:
         with self._connect() as conn:
             conn.execute("DELETE FROM rules WHERE id = ?", (int(rule_id),))
             conn.commit()
+
+    def add_ignored_path(self, path: str, reason: str = "Fixado pelo usuário") -> None:
+        norm = str(Path(path))
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ignored_paths (path, reason, created_at) VALUES (?, ?, ?)",
+                (norm, reason, now_iso),
+            )
+            conn.commit()
+
+    def remove_ignored_path(self, path: str) -> None:
+        norm = str(Path(path))
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM ignored_paths WHERE LOWER(path) = LOWER(?)",
+                (norm,),
+            )
+            conn.commit()
+
+    def list_ignored_paths(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM ignored_paths ORDER BY created_at DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    def get_ignored_set(self) -> set[str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT path FROM ignored_paths").fetchall()
+            return {str(Path(r["path"])).lower() for r in rows}
 
     def record_batch(self, description: str, items: list[dict]) -> int:
         now_iso = datetime.now(timezone.utc).isoformat()

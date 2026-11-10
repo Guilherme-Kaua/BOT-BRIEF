@@ -185,6 +185,15 @@ def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypa
     win.set_all_visible_checked(True)
     selected_ids = win.get_selected_item_ids()
     assert len(selected_ids) >= 2
+
+    # 4. Vida Tree tab is populated with F:\Vida folders and incoming count
+    assert win.vida_tree_widget.topLevelItemCount() >= 1
+
+    # 5. Ignore/Pin item removes it from queue and stores in ignored_paths
+    first_id = selected_ids[0]
+    win.ctrl.ignore_items([first_id])
+    assert all(i["id"] != first_id for i in win.ctrl.state["queue"])
+    assert len(win.ctrl.state["ignored_paths"]) == 1
     win.close()
 
 

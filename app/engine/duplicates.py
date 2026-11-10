@@ -1,7 +1,8 @@
 import hashlib
 import re
+import time
 from pathlib import Path
-from app.engine.protector import is_active_download, is_protected_path
+from app.engine.protector import ACTIVE_DOWNLOAD_SUFFIXES, is_active_download, is_protected_path
 
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 INSTALLER_EXTENSIONS = {".exe", ".msi", ".msix"}
@@ -214,4 +215,65 @@ def find_duplicates_and_revisions(
                 )
 
     return results
+
+
+def find_abandoned_partials_and_empty_dirs(
+    directories: list[Path],
+    now_ts: float | None = None,
+    skip_dirs: set[str] | None = None,
+) -> list[dict]:
+    cur_ts = now_ts if now_ts is not None else time.time()
+    skip_norm = {s.lower() for s in (skip_dirs or set())}
+    results: list[dict] = []
+
+    for d in directories:
+        dp = Path(d)
+        if not dp.exists():
+            continue
+        try:
+            entries = sorted(dp.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+
+        for entry in entries:
+            if entry.name.lower() == "desktop.ini" or entry.name.startswith("."):
+                continue
+            if is_protected_path(entry):
+                continue
+
+            if entry.is_file() and entry.suffix.lower() in ACTIVE_DOWNLOAD_SUFFIXES:
+                if not is_active_download(entry, now_ts=cur_ts):
+                    try:
+                        sz = entry.stat().st_size
+                    except OSError:
+                        sz = 0
+                    results.append(
+                        {
+                            "source_path": str(entry),
+                            "reason": "Download incompleto abandonado (> 24h)",
+                            "size_bytes": sz,
+                            "subtype": "abandoned_partial",
+                        }
+                    )
+            elif entry.is_dir():
+                if str(entry).lower() in skip_norm:
+                    continue
+                try:
+                    children = [
+                        c for c in entry.iterdir() if c.name.lower() not in {"desktop.ini", ".directory"}
+                    ]
+                except OSError:
+                    continue
+                if len(children) == 0:
+                    results.append(
+                        {
+                            "source_path": str(entry),
+                            "reason": f"Pasta vazia sem arquivos em {dp.name}",
+                            "size_bytes": 0,
+                            "subtype": "empty_folder",
+                        }
+                    )
+
+    return results
+
 
