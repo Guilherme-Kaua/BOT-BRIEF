@@ -42,6 +42,16 @@ class OpenFolderRequest(BaseModel):
     path: str
 
 
+class UpdateTargetRequest(BaseModel):
+    target_path: str
+    category: str | None = None
+
+
+class MoveToFolderRequest(BaseModel):
+    item_ids: list[str]
+    target_folder: str
+
+
 def create_app(config: AppConfig | None = None) -> FastAPI:
     cfg = config or AppConfig()
     db = Database(cfg.db_path)
@@ -168,5 +178,44 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             else:
                 os.startfile(str(target))
         return {"opened": str(target)}
+
+    @app.patch("/api/queue/{item_id}")
+    def api_update_queue_item(item_id: str, req: UpdateTargetRequest) -> dict[str, Any]:
+        report = _get_or_refresh_scan(force=False)
+        for item in report["queue"]:
+            if item["id"] == item_id:
+                item["target_path"] = str(Path(req.target_path))
+                if req.category:
+                    item["category"] = req.category
+                elif item["category"] == "espaco_recuperavel":
+                    item["category"] = "pronto_para_mover"
+                item["reason"] = f"Destino personalizado → {Path(req.target_path).name}"
+                item["rule_name"] = "Edição Manual"
+                return {"updated": item, "scan": _enrich_scan(report)}
+        raise HTTPException(status_code=404, detail="Item não encontrado na fila")
+
+    @app.post("/api/move-to-folder")
+    def api_move_to_folder(req: MoveToFolderRequest) -> dict[str, Any]:
+        report = _get_or_refresh_scan(force=False)
+        dest_dir = Path(req.target_folder)
+        wanted = set(req.item_ids)
+        custom_items = []
+        for item in report["queue"]:
+            if item["id"] in wanted:
+                src_name = Path(item["source_path"]).name
+                cloned = dict(item)
+                cloned["category"] = "pronto_para_mover"
+                cloned["target_path"] = str(dest_dir / src_name)
+                cloned["rule_name"] = f"Movido em lote p/ {dest_dir.name}"
+                custom_items.append(cloned)
+        res = execute_queue_items(custom_items, db, cfg, include_destructive_trash=False)
+        executed_ids = {r["id"] for r in res.get("results", []) if r.get("status") == "executed"}
+        if app.state.cached_scan is not None and executed_ids:
+            remaining = [i for i in app.state.cached_scan["queue"] if i["id"] not in executed_ids]
+            app.state.cached_scan["queue"] = remaining
+            app.state.cached_scan["summary"]["total_disorganized"] = len(remaining)
+            app.state.cached_scan["folder_cards"] = _build_folder_cards(cfg, remaining, {})
+        res["scan"] = _enrich_scan(app.state.cached_scan or scan_all(cfg, db))
+        return res
 
     return app

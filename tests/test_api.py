@@ -141,17 +141,18 @@ def test_desktop_gui_controller_instant_execute_and_undo(tmp_path: Path):
 
 
 def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypatch):
-    import customtkinter as ctk
-    from app.desktop_gui import launch_desktop_app
+    from PySide6 import QtWidgets
+    from app.desktop_gui import create_desktop_window
 
     dl = tmp_path / "Downloads"
     vida = tmp_path / "Vida"
     (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
     dl.mkdir()
 
-    # Create a recoverable installer (.exe) so rec_batch_frame is packed on startup
     installer = dl / "DiscordSetup.exe"
     installer.write_bytes(b"MZ-fake-installer")
+    pdf = vida / "02_Areas" / "Trabalho_ADS.pdf"
+    pdf.write_bytes(b"pdf-content")
 
     cfg = AppConfig(
         downloads_dir=dl,
@@ -163,8 +164,95 @@ def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypa
         db_path=tmp_path / "desktop_ui.db",
     )
 
-    monkeypatch.setattr(ctk.CTk, "mainloop", lambda self: self.destroy())
-    launch_desktop_app(cfg)
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = create_desktop_window(cfg, auto_scan_async=False)
+    win.ctrl.refresh(force=True)
+    win.render_all()
+
+    # 1. Table has both items rendered
+    assert win.table.rowCount() >= 2
+
+    # 2. Real-time search filters table rows
+    win.search_input.setText("Trabalho_ADS")
+    win.apply_filters()
+    visible_rows = [r for r in range(win.table.rowCount()) if not win.table.isRowHidden(r)]
+    assert len(visible_rows) == 1
+
+    win.search_input.setText("")
+    win.apply_filters()
+
+    # 3. Multi-select checkboxes work
+    win.set_all_visible_checked(True)
+    selected_ids = win.get_selected_item_ids()
+    assert len(selected_ids) >= 2
+    win.close()
+
+
+def test_desktop_controller_edit_target_multiselect_and_rules_crud(tmp_path: Path):
+    from app.desktop_gui import DesktopController
+
+    dl = tmp_path / "Downloads"
+    vida = tmp_path / "Vida"
+    (vida / "02_Areas" / "01_Faculdade" / "ADS").mkdir(parents=True)
+    dl.mkdir()
+
+    f1 = dl / "nota_fiscal_1.pdf"
+    f2 = dl / "nota_fiscal_2.pdf"
+    f1.write_bytes(b"nf1")
+    f2.write_bytes(b"nf2")
+
+    cfg = AppConfig(
+        downloads_dir=dl,
+        desktop_dir=tmp_path / "Desktop",
+        documents_dir=tmp_path / "Documents",
+        vida_root=vida,
+        projetos_dir=tmp_path / "Projetos",
+        folcolor_exe=tmp_path / "Folcolor.exe",
+        db_path=tmp_path / "crud.db",
+    )
+    ctrl = DesktopController(cfg)
+
+    # 1. Create a new rule via visual Rule Editor API
+    new_rule_id = ctrl.save_rule(
+        {
+            "name": "Notas Fiscais Financeiro",
+            "priority": 15,
+            "category_folder": "02_Areas",
+            "target_subpath": "02_Areas/02_Financeiro/Notas",
+            "folcolor_index": 6,
+            "keywords": ["nota_fiscal"],
+            "extensions": ["pdf"],
+            "source_scopes": ["*"],
+            "min_age_days": 0,
+            "enabled": 1,
+        }
+    )
+    assert new_rule_id > 0
+    state = ctrl.refresh(force=True)
+    items = [i for i in state["queue"] if "nota_fiscal" in i["source_path"]]
+    assert len(items) == 2
+
+    # 2. Edit target name/path of first item before moving
+    custom_dst = str(vida / "02_Areas" / "02_Financeiro" / "Notas" / "NF_Janeiro_Renomeada.pdf")
+    updated = ctrl.update_item_target(items[0]["id"], custom_dst)
+    assert updated is not None
+    assert updated["target_path"] == custom_dst
+
+    # 3. Execute single edited item
+    res1 = ctrl.execute_items([items[0]["id"]])
+    assert res1["executed_count"] == 1
+    assert Path(custom_dst).exists()
+
+    # 4. Move remaining selected item(s) to any custom folder in batch
+    custom_folder = vida / "03_Recursos" / "Arquivo_Especial"
+    res2 = ctrl.move_items_to_folder([items[1]["id"]], str(custom_folder))
+    assert res2["executed_count"] == 1
+    assert (custom_folder / "nota_fiscal_2.pdf").exists()
+
+    # 5. Delete rule
+    ctrl.delete_rule(new_rule_id)
+    assert all(r["id"] != new_rule_id for r in ctrl.state["rules"])
+
 
 
 
