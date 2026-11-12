@@ -203,6 +203,11 @@ def test_launch_desktop_app_builds_ui_without_tcl_error(tmp_path: Path, monkeypa
     assert ico_path.suffix == ".ico"
     assert ico_path.stat().st_size > 1000
     assert not win.windowIcon().isNull()
+
+    # 7. Storage Monitor tab is populated non-destructively
+    assert "storage_monitor" in win.ctrl.state
+    assert win.ctrl.state["storage_monitor"]["safe_mode_non_destructive"] is True
+    assert win.storage_growth_table.rowCount() >= 1
     win.close()
 
 

@@ -12,6 +12,7 @@ from app.engine.duplicates import (
 )
 from app.engine.folcolor import build_vida_tree, scan_missing_icons
 from app.engine.protector import is_active_download, is_protected_path
+from app.engine.storage_monitor import analyze_storage
 from app.engine.rules import (
     evaluate_file,
     is_unstandardized_folder_name,
@@ -268,6 +269,7 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
         "queue": queue,
         "vida_tree": build_vida_tree(config.vida_root, config.folcolor_exe, queue),
         "ignored_paths": db.list_ignored_paths(),
+        "storage_monitor": analyze_storage(config, db, now_ts=current_ts),
     }
 
 

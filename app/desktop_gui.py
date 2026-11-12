@@ -10,6 +10,7 @@ from app.db import Database
 from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.folcolor import apply_folcolor_icon, build_vida_tree
 from app.engine.scanner import _build_folder_cards, scan_all
+from app.engine.storage_monitor import analyze_storage
 from app.tray.tray_agent import ensure_app_icon_ico
 
 FOLCOLOR_PALETTE: list[tuple[int, str, str]] = [
@@ -66,7 +67,17 @@ class DesktopController:
             self.config.folcolor_exe,
             self.state.get("queue", []),
         )
+        if "storage_monitor" not in self.state:
+            self.state["storage_monitor"] = analyze_storage(self.config, self.db)
         return self.state
+
+    def reset_storage_baseline(self) -> dict[str, Any]:
+        self.state["storage_monitor"] = analyze_storage(
+            self.config,
+            self.db,
+            reset_baseline=True,
+        )
+        return self.state["storage_monitor"]
 
     def update_item_target(
         self,
@@ -616,6 +627,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             root_layout.addWidget(self.tabs, 1)
 
             self._build_queue_tab()
+            self._build_storage_tab()
             self._build_vida_tree_tab()
             self._build_rules_tab()
             self._build_history_tab()
@@ -1010,6 +1022,115 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             layout.addWidget(self.history_table, 1)
             self.tabs.addTab(tab, "🕒 Histórico & Desfazer (Undo)")
 
+        def _build_storage_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            banner = QtWidgets.QLabel(
+                "🔒 <b>Modo Seguro Não-Destrutivo Ativo:</b> Monitoramento contínuo de espaço em disco, "
+                "crescimento anormal de pastas, arquivos temporários e downloads abandonados (&gt;24h) "
+                "<b>sem nenhuma limpeza automática destrutiva</b>."
+            )
+            banner.setWordWrap(True)
+            banner.setStyleSheet(
+                "background-color: #064e3b; border: 1px solid #10b981; border-radius: 8px; padding: 10px; color: #d1fae5;"
+            )
+            layout.addWidget(banner)
+
+            # Drives row
+            self.drives_container = QtWidgets.QWidget()
+            self.drives_layout = QtWidgets.QHBoxLayout(self.drives_container)
+            self.drives_layout.setContentsMargins(0, 0, 0, 0)
+            self.drives_layout.setSpacing(10)
+            layout.addWidget(self.drives_container)
+
+            # Active Alerts table
+            layout.addWidget(QtWidgets.QLabel("<b>🚨 Alertas Ativos de Armazenamento</b>"))
+            self.storage_alerts_table = QtWidgets.QTableWidget(0, 4)
+            self.storage_alerts_table.setAlternatingRowColors(True)
+            self.storage_alerts_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.storage_alerts_table.verticalHeader().setVisible(False)
+            self.storage_alerts_table.verticalHeader().setDefaultSectionSize(36)
+            self.storage_alerts_table.setMaximumHeight(135)
+            self.storage_alerts_table.setHorizontalHeaderLabels(["Nível", "Alerta", "Diagnóstico Detalhado", "Local"])
+            ah = self.storage_alerts_table.horizontalHeader()
+            ah.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_alerts_table.setColumnWidth(0, 110)
+            ah.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.storage_alerts_table.setColumnWidth(1, 260)
+            ah.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            ah.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.storage_alerts_table.setColumnWidth(3, 180)
+            layout.addWidget(self.storage_alerts_table)
+
+            # Split bottom: Folder Growth (left) vs Temp & Abandoned Downloads (right)
+            bottom_split = QtWidgets.QHBoxLayout()
+            bottom_split.setSpacing(12)
+
+            # Left: Folder Growth
+            growth_col = QtWidgets.QVBoxLayout()
+            g_top = QtWidgets.QHBoxLayout()
+            g_top.addWidget(QtWidgets.QLabel("<b>📈 Crescimento de Pastas (vs. Linha de Base)</b>"))
+            g_top.addStretch()
+            btn_reset_base = QtWidgets.QPushButton("🔄 Atualizar Linha de Base (Zerar Δ)")
+            btn_reset_base.clicked.connect(self.on_reset_storage_baseline)
+            g_top.addWidget(btn_reset_base)
+            growth_col.addLayout(g_top)
+
+            self.storage_growth_table = QtWidgets.QTableWidget(0, 5)
+            self.storage_growth_table.setAlternatingRowColors(True)
+            self.storage_growth_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.storage_growth_table.verticalHeader().setVisible(False)
+            self.storage_growth_table.verticalHeader().setDefaultSectionSize(36)
+            self.storage_growth_table.setHorizontalHeaderLabels(
+                ["Pasta Monitorada", "Tamanho Atual", "Variação (Δ)", "Status", "Abrir"]
+            )
+            gh = self.storage_growth_table.horizontalHeader()
+            gh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            gh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_growth_table.setColumnWidth(1, 110)
+            gh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_growth_table.setColumnWidth(2, 120)
+            gh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_growth_table.setColumnWidth(3, 150)
+            gh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_growth_table.setColumnWidth(4, 60)
+            growth_col.addWidget(self.storage_growth_table, 1)
+            bottom_split.addLayout(growth_col, 1)
+
+            # Right: Temp files & Abandoned Downloads
+            temp_col = QtWidgets.QVBoxLayout()
+            self.lbl_temp_header = QtWidgets.QLabel(
+                "<b>🧪 Arquivos Temporários & Downloads Abandonados (&gt;24h)</b>"
+            )
+            temp_col.addWidget(self.lbl_temp_header)
+
+            self.storage_temp_table = QtWidgets.QTableWidget(0, 5)
+            self.storage_temp_table.setAlternatingRowColors(True)
+            self.storage_temp_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.storage_temp_table.verticalHeader().setVisible(False)
+            self.storage_temp_table.verticalHeader().setDefaultSectionSize(36)
+            self.storage_temp_table.setHorizontalHeaderLabels(
+                ["Arquivo", "Tipo", "Tamanho", "Idade", "Explorer"]
+            )
+            th = self.storage_temp_table.horizontalHeader()
+            th.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            th.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.storage_temp_table.setColumnWidth(1, 175)
+            th.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_temp_table.setColumnWidth(2, 95)
+            th.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_temp_table.setColumnWidth(3, 80)
+            th.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.storage_temp_table.setColumnWidth(4, 70)
+            temp_col.addWidget(self.storage_temp_table, 1)
+            bottom_split.addLayout(temp_col, 1)
+
+            layout.addLayout(bottom_split, 1)
+            self.tabs.addTab(tab, "📊 Monitor de Armazenamento")
+
         def trigger_async_scan(self):
             if self.scan_worker and self.scan_worker.isRunning():
                 return
@@ -1062,6 +1183,7 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self._render_health_cards()
             self._update_pill_counts()
             self._populate_queue_table()
+            self._populate_storage_tab()
             self._populate_vida_tree()
             self._populate_rules_table()
             self._populate_ignored_table()
@@ -1425,6 +1547,125 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             res = self.ctrl.undo_last(batch_id)
             self.lbl_status.setText(f"↩ Desfeito: {res['undone_count']} item(ns) restaurado(s) ao local original.")
             self.render_all()
+
+        def on_reset_storage_baseline(self):
+            self.ctrl.reset_storage_baseline()
+            self.lbl_status.setText("🔄 Linha de base de tamanho das pastas atualizada com sucesso!")
+            self.render_all()
+
+        def _populate_storage_tab(self):
+            mon = self.ctrl.state.get("storage_monitor", {})
+
+            # 1. Drives cards
+            while self.drives_layout.count():
+                child = self.drives_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+
+            for drv in mon.get("drives", []):
+                col = {"red": "#ef4444", "amber": "#f59e0b", "green": "#10b981"}.get(
+                    drv.get("status_level", "green"), "#10b981"
+                )
+                card = QtWidgets.QFrame()
+                card.setObjectName("SurfaceCard")
+                card.setStyleSheet(
+                    f"QFrame#SurfaceCard {{ background-color: #111827; border: 1px solid {col}; border-radius: 8px; }}"
+                )
+                cl = QtWidgets.QVBoxLayout(card)
+                cl.setContentsMargins(14, 10, 14, 10)
+                lbl = QtWidgets.QLabel(
+                    f"<b>💾 {drv['label']}</b> — {drv['used_pct']:.1f}% ocupado "
+                    f"({format_bytes(drv['free_bytes'])} livres de {format_bytes(drv['total_bytes'])})"
+                )
+                lbl.setStyleSheet(f"color: {col}; font-size: 13px;")
+                cl.addWidget(lbl)
+
+                bar = QtWidgets.QProgressBar()
+                bar.setRange(0, 100)
+                bar.setValue(int(drv["used_pct"]))
+                bar.setFixedHeight(12)
+                bar.setTextVisible(False)
+                bar.setStyleSheet(
+                    f"QProgressBar {{ background-color: #0f172a; border-radius: 6px; border: 1px solid #1e293b; }}"
+                    f"QProgressBar::chunk {{ background-color: {col}; border-radius: 5px; }}"
+                )
+                cl.addWidget(bar)
+                self.drives_layout.addWidget(card, 1)
+
+            # 2. Active Alerts
+            alerts = mon.get("alerts", [])
+            self.storage_alerts_table.setRowCount(len(alerts))
+            for idx, a in enumerate(alerts):
+                sev = a.get("severity", "info")
+                sev_lbl, sev_col = {
+                    "critical": ("🔴 CRÍTICO", "#ef4444"),
+                    "warning": ("🟠 ATENÇÃO", "#f59e0b"),
+                    "info": ("🔵 INFO", "#3b82f6"),
+                }.get(sev, ("🔵 INFO", "#3b82f6"))
+
+                s_item = QtWidgets.QTableWidgetItem(sev_lbl)
+                s_item.setForeground(QtGui.QColor(sev_col))
+                self.storage_alerts_table.setItem(idx, 0, s_item)
+                self.storage_alerts_table.setItem(idx, 1, QtWidgets.QTableWidgetItem(a.get("title", "")))
+                self.storage_alerts_table.setItem(idx, 2, QtWidgets.QTableWidgetItem(a.get("detail", "")))
+                self.storage_alerts_table.setItem(idx, 3, QtWidgets.QTableWidgetItem(a.get("path", "")))
+
+            # 3. Folder Growth Table
+            growth_list = mon.get("folder_growth", [])
+            self.storage_growth_table.setRowCount(len(growth_list))
+            for idx, g in enumerate(growth_list):
+                self.storage_growth_table.setItem(idx, 0, QtWidgets.QTableWidgetItem(f"📁 {g['name']}"))
+                self.storage_growth_table.setItem(
+                    idx, 1, QtWidgets.QTableWidgetItem(format_bytes(g.get("current_bytes", 0)))
+                )
+                delta = int(g.get("delta_bytes", 0))
+                delta_str = f"+{format_bytes(delta)}" if delta > 0 else "0 B (Estável)"
+                d_item = QtWidgets.QTableWidgetItem(delta_str)
+                abnormal = bool(g.get("abnormal_growth", False))
+                d_item.setForeground(QtGui.QColor("#ef4444" if abnormal else "#94a3b8"))
+                self.storage_growth_table.setItem(idx, 2, d_item)
+
+                st_txt = "⚠️ Crescimento Anormal" if abnormal else "✓ Normal"
+                st_item = QtWidgets.QTableWidgetItem(st_txt)
+                st_item.setForeground(QtGui.QColor("#ef4444" if abnormal else "#10b981"))
+                self.storage_growth_table.setItem(idx, 3, st_item)
+
+                w_open = QtWidgets.QWidget()
+                wl = QtWidgets.QHBoxLayout(w_open)
+                wl.setContentsMargins(2, 2, 2, 2)
+                b_op = QtWidgets.QPushButton("📂")
+                b_op.setFixedWidth(34)
+                b_op.clicked.connect(lambda checked=False, p=g["path"]: self.ctrl.open_in_explorer(p))
+                wl.addWidget(b_op)
+                self.storage_growth_table.setCellWidget(idx, 4, w_open)
+
+            # 4. Temp & Abandoned Downloads Table
+            ta = mon.get("temp_and_abandoned", {})
+            t_items = ta.get("items", [])
+            self.lbl_temp_header.setText(
+                f"<b>🧪 Temporários & Downloads Abandonados: {ta.get('total_count', 0)} item(ns) "
+                f"({format_bytes(ta.get('total_bytes', 0))})</b>"
+            )
+            self.storage_temp_table.setRowCount(len(t_items))
+            for idx, ti in enumerate(t_items):
+                self.storage_temp_table.setItem(idx, 0, QtWidgets.QTableWidgetItem(ti["name"]))
+                k_item = QtWidgets.QTableWidgetItem(ti["kind_label"])
+                k_col = "#f59e0b" if ti["kind"] == "abandoned_download" else "#60a5fa"
+                k_item.setForeground(QtGui.QColor(k_col))
+                self.storage_temp_table.setItem(idx, 1, k_item)
+                self.storage_temp_table.setItem(
+                    idx, 2, QtWidgets.QTableWidgetItem(format_bytes(ti.get("size_bytes", 0)))
+                )
+                self.storage_temp_table.setItem(idx, 3, QtWidgets.QTableWidgetItem(f"{ti.get('age_hours', 0)}h"))
+
+                w_exp = QtWidgets.QWidget()
+                w_el = QtWidgets.QHBoxLayout(w_exp)
+                w_el.setContentsMargins(2, 2, 2, 2)
+                b_ex = QtWidgets.QPushButton("📂")
+                b_ex.setFixedWidth(34)
+                b_ex.clicked.connect(lambda checked=False, p=ti["path"]: self.ctrl.open_in_explorer(p))
+                w_el.addWidget(b_ex)
+                self.storage_temp_table.setCellWidget(idx, 4, w_exp)
 
         # --- Vida Tree Tab Logic ---
         def _populate_vida_tree(self):

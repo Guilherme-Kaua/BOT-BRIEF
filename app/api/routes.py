@@ -11,6 +11,7 @@ from app.config import AppConfig
 from app.db import Database
 from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.scanner import _build_folder_cards, scan_all
+from app.engine.storage_monitor import analyze_storage
 
 
 class ExecuteRequest(BaseModel):
@@ -160,6 +161,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/history")
     def api_history() -> list[dict]:
         return db.list_batches(limit=25)
+
+    @app.get("/api/storage")
+    def api_storage(reset_baseline: int = 0) -> dict[str, Any]:
+        return analyze_storage(cfg, db, reset_baseline=bool(reset_baseline))
 
     @app.post("/api/toggle-watch")
     def api_toggle_watch() -> dict[str, Any]:

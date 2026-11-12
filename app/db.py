@@ -218,6 +218,14 @@ class Database:
                     reason TEXT NOT NULL DEFAULT 'Fixado pelo usuário',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS folder_size_snapshots (
+                    folder_path TEXT PRIMARY KEY,
+                    folder_name TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    file_count INTEGER NOT NULL,
+                    recorded_at REAL NOT NULL
+                );
                 """
             )
             count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
@@ -388,6 +396,31 @@ class Database:
         with self._connect() as conn:
             rows = conn.execute("SELECT path FROM ignored_paths").fetchall()
             return {str(Path(r["path"])).lower() for r in rows}
+
+    def get_folder_snapshots(self) -> dict[str, dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM folder_size_snapshots").fetchall()
+            return {str(Path(r["folder_path"])).lower(): dict(r) for r in rows}
+
+    def upsert_folder_snapshot(
+        self,
+        folder_path: str,
+        folder_name: str,
+        size_bytes: int,
+        file_count: int,
+        recorded_at: float,
+    ) -> None:
+        norm = str(Path(folder_path))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO folder_size_snapshots
+                (folder_path, folder_name, size_bytes, file_count, recorded_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (norm, folder_name, int(size_bytes), int(file_count), float(recorded_at)),
+            )
+            conn.commit()
 
     def record_batch(self, description: str, items: list[dict]) -> int:
         now_iso = datetime.now(timezone.utc).isoformat()

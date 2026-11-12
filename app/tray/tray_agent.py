@@ -83,6 +83,7 @@ class TrayAgent:
         self.fastapi_app = fastapi_app
         self.stop_event = threading.Event()
         self.icon: pystray.Icon | None = None
+        self._notified_alerts: set[str] = set()
 
     def _is_watch_enabled(self) -> bool:
         if self.fastapi_app is not None:
@@ -95,6 +96,18 @@ class TrayAgent:
                 continue
             try:
                 report = scan_all(self.config, self.db)
+                # Non-destructive storage alerts notification
+                storage_alerts = report.get("storage_monitor", {}).get("alerts", [])
+                for alert in storage_alerts:
+                    if alert.get("severity") in {"critical", "warning"}:
+                        alert_key = f"{alert.get('type')}::{alert.get('title')}"
+                        if alert_key not in self._notified_alerts and self.icon:
+                            self._notified_alerts.add(alert_key)
+                            try:
+                                self.icon.notify(alert.get("detail", ""), alert.get("title", "Monitor de Armazenamento"))
+                            except Exception:
+                                pass
+
                 auto_items = [
                     item
                     for item in report["queue"]
