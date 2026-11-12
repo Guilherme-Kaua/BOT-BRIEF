@@ -77,6 +77,7 @@ def execute_queue_items(
                     continue
                 final_dst = resolve_collision_path(dst, src)
                 shutil.move(str(src), str(final_dst))
+                db.relocate_file_tags(str(src), str(final_dst))
 
                 # Ensure parent folder inside F:\Vida has its Folcolor icon applied
                 if needs_folcolor_icon(final_dst.parent, config.vida_root, config.folcolor_exe):
@@ -143,6 +144,7 @@ def execute_queue_items(
                     archive_dst.parent.mkdir(parents=True, exist_ok=True)
                     final_dst = resolve_collision_path(archive_dst, src)
                     shutil.move(str(src), str(final_dst))
+                    db.relocate_file_tags(str(src), str(final_dst))
                     executed_records.append(
                         {
                             "action_type": "archive",
@@ -198,6 +200,7 @@ def undo_batch(batch_id: int, db: Database) -> dict:
                     continue
                 src.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dst), str(src))
+                db.relocate_file_tags(str(dst), str(src))
                 undone_count += 1
                 details.append({"source_path": str(src), "status": "restored"})
             elif action_type == "icon":

@@ -9,8 +9,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from app.config import AppConfig
 from app.db import Database
+from app.engine.duplicates import archive_duplicate_extras, build_duplicate_groups
 from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.scanner import _build_folder_cards, scan_all
+from app.engine.semantic_search import SMART_TAGS_CATALOG, parse_natural_query, semantic_search_files
 from app.engine.storage_monitor import analyze_storage
 
 
@@ -51,6 +53,16 @@ class UpdateTargetRequest(BaseModel):
 class MoveToFolderRequest(BaseModel):
     item_ids: list[str]
     target_folder: str
+
+
+class ArchiveDuplicatesRequest(BaseModel):
+    extra_paths: list[str]
+    mode: str = "archive"
+
+
+class TagActionRequest(BaseModel):
+    path: str
+    tag: str
 
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
@@ -165,6 +177,50 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/storage")
     def api_storage(reset_baseline: int = 0) -> dict[str, Any]:
         return analyze_storage(cfg, db, reset_baseline=bool(reset_baseline))
+
+    @app.get("/api/duplicates")
+    def api_duplicates() -> list[dict[str, Any]]:
+        return build_duplicate_groups(cfg)
+
+    @app.post("/api/duplicates/archive")
+    def api_archive_duplicates(req: ArchiveDuplicatesRequest) -> dict[str, Any]:
+        res = archive_duplicate_extras(req.extra_paths, db, cfg, mode=req.mode)
+        res["scan"] = _get_or_refresh_scan(force=True)
+        return res
+
+    @app.get("/api/search")
+    def api_semantic_search(q: str = "", tag: str | None = None, limit: int = 80) -> dict[str, Any]:
+        return {
+            "query": q,
+            "tag": tag,
+            "parsed": parse_natural_query(q),
+            "results": semantic_search_files(q, cfg, db, tag_filter=tag, limit=limit),
+        }
+
+    @app.get("/api/tags")
+    def api_list_tags(tag: str | None = None) -> dict[str, Any]:
+        return {
+            "catalog": SMART_TAGS_CATALOG,
+            "files": db.list_files_by_tag(tag),
+        }
+
+    @app.post("/api/tags")
+    def api_add_tag(req: TagActionRequest) -> dict[str, Any]:
+        db.add_file_tag(req.path, req.tag)
+        return {
+            "path": req.path,
+            "tags": db.get_tags_for_path(req.path),
+            "files": db.list_files_by_tag(),
+        }
+
+    @app.delete("/api/tags")
+    def api_remove_tag(req: TagActionRequest) -> dict[str, Any]:
+        db.remove_file_tag(req.path, req.tag)
+        return {
+            "path": req.path,
+            "tags": db.get_tags_for_path(req.path),
+            "files": db.list_files_by_tag(),
+        }
 
     @app.post("/api/toggle-watch")
     def api_toggle_watch() -> dict[str, Any]:

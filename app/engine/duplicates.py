@@ -277,3 +277,239 @@ def find_abandoned_partials_and_empty_dirs(
     return results
 
 
+def _collect_candidate_files_for_duplicate_center(config) -> list[Path]:
+    from app.config import FOLCOLOR_CATEGORY_MAP
+
+    roots = [
+        config.downloads_dir,
+        config.desktop_dir,
+        config.documents_dir,
+    ]
+    for cat in FOLCOLOR_CATEGORY_MAP:
+        roots.append(config.vida_root / cat)
+
+    files: list[Path] = []
+    seen: set[str] = set()
+
+    def _walk(d: Path, depth: int, max_depth: int) -> None:
+        if depth > max_depth or not d.exists():
+            return
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: p.name.lower())
+        except (PermissionError, OSError):
+            return
+        for e in entries:
+            if e.name.lower() == "desktop.ini" or e.name.startswith("."):
+                continue
+            if is_protected_path(e, getattr(config, "projetos_dir", None)):
+                continue
+            if e.is_file() and not is_active_download(e):
+                key = str(e).lower()
+                if key not in seen:
+                    seen.add(key)
+                    files.append(e)
+            elif e.is_dir() and depth < max_depth:
+                # Skip 04_Arquivo_Morto/Limpeza_Downloads so already-archived duplicates aren't re-grouped
+                if e.name.lower() in {"limpeza_downloads", "duplicados_arquivados"}:
+                    continue
+                _walk(e, depth + 1, max_depth)
+
+    for r in roots:
+        depth_limit = 2 if str(r).lower().startswith(str(config.vida_root).lower()) else 1
+        _walk(r, 0, depth_limit)
+    return files
+
+
+def build_duplicate_groups(config) -> list[dict]:
+    """
+    Builds detailed duplicate & similar file groups for the Central de Duplicados:
+    - Exact SHA-256 duplicate groups
+    - Versioned / similar revision groups (v1, v2, (1))
+    Each group reports total_bytes, wasted_bytes, keeper (preserved version), and extras.
+    """
+    files = _collect_candidate_files_for_duplicate_center(config)
+    vida_resolved = Path(config.vida_root).resolve() if config.vida_root else None
+
+    def _is_in_organized_vida(p: Path) -> bool:
+        if vida_resolved is None:
+            return False
+        try:
+            rel = p.resolve().relative_to(vida_resolved)
+            return bool(rel.parts and rel.parts[0] not in {"99_Inbox", "04_Arquivo_Morto"})
+        except ValueError:
+            return False
+
+    groups: list[dict] = []
+    grouped_paths: set[str] = set()
+
+    # 1. Exact SHA-256 duplicates
+    by_size: dict[int, list[Path]] = {}
+    for f in files:
+        try:
+            sz = f.stat().st_size
+        except OSError:
+            continue
+        if sz > 0:
+            by_size.setdefault(sz, []).append(f)
+
+    for sz, same_size_files in by_size.items():
+        if len(same_size_files) < 2:
+            continue
+        by_hash: dict[str, list[Path]] = {}
+        for f in same_size_files:
+            digest = _sha256_file(f)
+            if digest:
+                by_hash.setdefault(digest, []).append(f)
+
+        for digest, dup_list in by_hash.items():
+            if len(dup_list) < 2:
+                continue
+            sorted_dups = sorted(
+                dup_list,
+                key=lambda p: (not _is_in_organized_vida(p), len(p.name), -p.stat().st_mtime),
+            )
+            keeper = sorted_dups[0]
+            extras = sorted_dups[1:]
+            for p in sorted_dups:
+                grouped_paths.add(str(p).lower())
+
+            keep_reason = (
+                "Preservado no F:\\Vida (cópia organizada principal)"
+                if _is_in_organized_vida(keeper)
+                else "Preservado (nome mais limpo / mais recente)"
+            )
+            groups.append(
+                {
+                    "group_id": f"sha256_{digest[:10]}",
+                    "group_type": "exact_sha256",
+                    "group_label": f"Cópia Idêntica (SHA-256: {digest[:8]})",
+                    "title": keeper.name,
+                    "copy_count": len(sorted_dups),
+                    "total_bytes": sz * len(sorted_dups),
+                    "wasted_bytes": sz * len(extras),
+                    "keeper": {
+                        "name": keeper.name,
+                        "path": str(keeper),
+                        "folder": str(keeper.parent),
+                        "size_bytes": sz,
+                        "reason": keep_reason,
+                    },
+                    "extras": [
+                        {
+                            "name": ex.name,
+                            "path": str(ex),
+                            "folder": str(ex.parent),
+                            "size_bytes": sz,
+                            "reason": f"Duplicado exato de '{keeper.name}'",
+                        }
+                        for ex in extras
+                    ],
+                }
+            )
+
+    # 2. Similar / Versioned Revisions (v1/v2 or (1)/(2))
+    rev_groups: dict[tuple[str, str], list[tuple[int, Path]]] = {}
+    for f in files:
+        if str(f).lower() in grouped_paths:
+            continue
+        m = REVISION_RE.match(f.stem)
+        if m:
+            base = _collapse_ws(m.group(1))
+            ver = int(m.group(2) or m.group(3) or 0)
+            rev_groups.setdefault((base, f.suffix.lower()), []).append((ver, f))
+
+    for (base, ext), rev_list in rev_groups.items():
+        if len(rev_list) < 2:
+            continue
+        rev_list.sort(key=lambda item: (item[0], item[1].stat().st_mtime), reverse=True)
+        newest_ver, keeper = rev_list[0]
+        extras = [item[1] for item in rev_list[1:]]
+        try:
+            keeper_sz = keeper.stat().st_size
+        except OSError:
+            keeper_sz = 0
+        extra_entries = []
+        wasted = 0
+        for ver, ex in rev_list[1:]:
+            try:
+                esz = ex.stat().st_size
+            except OSError:
+                esz = 0
+            wasted += esz
+            extra_entries.append(
+                {
+                    "name": ex.name,
+                    "path": str(ex),
+                    "folder": str(ex.parent),
+                    "size_bytes": esz,
+                    "reason": f"Versão anterior v{ver} (preservando '{keeper.name}')",
+                }
+            )
+        groups.append(
+            {
+                "group_id": f"rev_{hashlib.sha1(f'{base}{ext}'.encode()).hexdigest()[:10]}",
+                "group_type": "version_revision",
+                "group_label": "Versões Semelhantes / Revisões",
+                "title": f"{base}{ext}",
+                "copy_count": len(rev_list),
+                "total_bytes": keeper_sz + wasted,
+                "wasted_bytes": wasted,
+                "keeper": {
+                    "name": keeper.name,
+                    "path": str(keeper),
+                    "folder": str(keeper.parent),
+                    "size_bytes": keeper_sz,
+                    "reason": f"Versão mais recente (v{newest_ver}) preservada",
+                },
+                "extras": extra_entries,
+            }
+        )
+
+    groups.sort(key=lambda g: g["wasted_bytes"], reverse=True)
+    return groups
+
+
+def archive_duplicate_extras(
+    extra_paths: list[str],
+    db,
+    config,
+    mode: str = "archive",
+) -> dict:
+    """
+    Manual and reversible action for the Central de Duplicados:
+    Moves selected extra copies into 04_Arquivo_Morto/Duplicados_Arquivados (or RecycleBin)
+    and records a reversible batch in SQLite.
+    """
+    from app.engine.executor import execute_queue_items
+
+    archive_dir = config.vida_root / "04_Arquivo_Morto" / "Duplicados_Arquivados"
+    items_to_run = []
+    for sp in extra_paths:
+        p = Path(sp)
+        if not p.exists():
+            continue
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        items_to_run.append(
+            {
+                "id": hashlib.sha1(sp.encode("utf-8")).hexdigest()[:12],
+                "category": "espaco_recuperavel",
+                "source_path": str(p),
+                "target_path": str(archive_dir / p.name),
+                "size_bytes": sz,
+                "reason": "Cópia extra arquivada pela Central de Duplicados",
+                "rule_name": "Central de Duplicados",
+            }
+        )
+    return execute_queue_items(
+        items_to_run,
+        db,
+        config,
+        include_destructive_trash=True,
+        recoverable_mode=mode,
+    )
+
+
+

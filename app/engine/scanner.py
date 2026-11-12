@@ -5,6 +5,7 @@ from pathlib import Path
 from app.config import AppConfig, FOLCOLOR_CATEGORY_MAP
 from app.db import Database
 from app.engine.duplicates import (
+    build_duplicate_groups,
     find_abandoned_partials_and_empty_dirs,
     find_duplicates_and_revisions,
     find_installers,
@@ -270,6 +271,8 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
         "vida_tree": build_vida_tree(config.vida_root, config.folcolor_exe, queue),
         "ignored_paths": db.list_ignored_paths(),
         "storage_monitor": analyze_storage(config, db, now_ts=current_ts),
+        "duplicate_groups": build_duplicate_groups(config),
+        "tagged_files": db.list_files_by_tag(),
     }
 
 

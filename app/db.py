@@ -226,6 +226,13 @@ class Database:
                     file_count INTEGER NOT NULL,
                     recorded_at REAL NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS file_tags (
+                    path TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (path, tag)
+                );
                 """
             )
             count = conn.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
@@ -420,6 +427,87 @@ class Database:
                 """,
                 (norm, folder_name, int(size_bytes), int(file_count), float(recorded_at)),
             )
+            conn.commit()
+
+    def add_file_tag(self, path: str, tag: str) -> None:
+        norm_path = str(Path(path))
+        clean_tag = tag.strip()
+        if not clean_tag:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO file_tags (path, tag, created_at) VALUES (?, ?, ?)",
+                (norm_path, clean_tag, now_iso),
+            )
+            conn.commit()
+
+    def remove_file_tag(self, path: str, tag: str) -> None:
+        norm_path = str(Path(path))
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM file_tags WHERE LOWER(path) = LOWER(?) AND LOWER(tag) = LOWER(?)",
+                (norm_path, tag.strip()),
+            )
+            conn.commit()
+
+    def get_tags_for_path(self, path: str) -> list[str]:
+        norm_path = str(Path(path))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag FROM file_tags WHERE LOWER(path) = LOWER(?) ORDER BY tag ASC",
+                (norm_path,),
+            ).fetchall()
+            return [str(r["tag"]) for r in rows]
+
+    def get_all_file_tags_map(self) -> dict[str, list[str]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT path, tag FROM file_tags ORDER BY tag ASC").fetchall()
+            out: dict[str, list[str]] = {}
+            for r in rows:
+                key = str(Path(r["path"])).lower()
+                out.setdefault(key, []).append(str(r["tag"]))
+            return out
+
+    def list_files_by_tag(self, tag: str | None = None) -> list[dict]:
+        with self._connect() as conn:
+            if tag and tag != "all":
+                rows = conn.execute(
+                    "SELECT path, tag, created_at FROM file_tags WHERE LOWER(tag) = LOWER(?) ORDER BY created_at DESC",
+                    (tag.strip(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT path, tag, created_at FROM file_tags ORDER BY created_at DESC"
+                ).fetchall()
+            by_path: dict[str, dict] = {}
+            for r in rows:
+                p_str = str(Path(r["path"]))
+                key = p_str.lower()
+                if key not in by_path:
+                    by_path[key] = {"path": p_str, "tags": [], "created_at": r["created_at"]}
+                if r["tag"] not in by_path[key]["tags"]:
+                    by_path[key]["tags"].append(r["tag"])
+            return list(by_path.values())
+
+    def relocate_file_tags(self, old_path: str, new_path: str) -> None:
+        old_norm = str(Path(old_path))
+        new_norm = str(Path(new_path))
+        if old_norm.lower() == new_norm.lower():
+            return
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, created_at FROM file_tags WHERE LOWER(path) = LOWER(?)",
+                (old_norm,),
+            ).fetchall()
+            if not rows:
+                return
+            conn.execute("DELETE FROM file_tags WHERE LOWER(path) = LOWER(?)", (old_norm,))
+            for r in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO file_tags (path, tag, created_at) VALUES (?, ?, ?)",
+                    (new_norm, r["tag"], r["created_at"]),
+                )
             conn.commit()
 
     def record_batch(self, description: str, items: list[dict]) -> int:

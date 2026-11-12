@@ -7,9 +7,15 @@ from typing import Any
 
 from app.config import AppConfig
 from app.db import Database
+from app.engine.duplicates import archive_duplicate_extras, build_duplicate_groups
 from app.engine.executor import execute_queue_items, undo_batch
 from app.engine.folcolor import apply_folcolor_icon, build_vida_tree
 from app.engine.scanner import _build_folder_cards, scan_all
+from app.engine.semantic_search import (
+    SMART_TAGS_CATALOG,
+    parse_natural_query,
+    semantic_search_files,
+)
 from app.engine.storage_monitor import analyze_storage
 from app.tray.tray_agent import ensure_app_icon_ico
 
@@ -69,7 +75,38 @@ class DesktopController:
         )
         if "storage_monitor" not in self.state:
             self.state["storage_monitor"] = analyze_storage(self.config, self.db)
+        if "duplicate_groups" not in self.state:
+            self.state["duplicate_groups"] = build_duplicate_groups(self.config)
+        self.state["tagged_files"] = self.db.list_files_by_tag()
         return self.state
+
+    def archive_duplicates(self, extra_paths: list[str], mode: str = "archive") -> dict[str, Any]:
+        res = archive_duplicate_extras(extra_paths, self.db, self.config, mode=mode)
+        self.refresh(force=True)
+        return res
+
+    def semantic_search(self, query: str, tag_filter: str | None = None) -> dict[str, Any]:
+        return {
+            "query": query,
+            "parsed": parse_natural_query(query),
+            "results": semantic_search_files(
+                query,
+                self.config,
+                self.db,
+                tag_filter=tag_filter,
+                limit=80,
+            ),
+        }
+
+    def add_tag(self, path: str, tag: str) -> list[str]:
+        self.db.add_file_tag(path, tag)
+        self.state["tagged_files"] = self.db.list_files_by_tag()
+        return self.db.get_tags_for_path(path)
+
+    def remove_tag(self, path: str, tag: str) -> list[str]:
+        self.db.remove_file_tag(path, tag)
+        self.state["tagged_files"] = self.db.list_files_by_tag()
+        return self.db.get_tags_for_path(path)
 
     def reset_storage_baseline(self) -> dict[str, Any]:
         self.state["storage_monitor"] = analyze_storage(
@@ -551,12 +588,83 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             fname = self.name_edit.text().strip() or Path(self.item["source_path"]).name
             return str(folder / fname)
 
+    class SmartTagDialog(QtWidgets.QDialog):
+        def __init__(self, parent, target_paths: list[str], existing_tags: list[str]):
+            super().__init__(parent)
+            self.setWindowTitle("🏷️ Etiquetas Inteligentes")
+            self.setMinimumWidth(460)
+            self.setStyleSheet(DARK_FLUENT_QSS)
+
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(20, 18, 20, 18)
+            layout.setSpacing(10)
+
+            desc = (
+                f"Aplicar etiquetas a <b>{len(target_paths)}</b> arquivo(s). "
+                "As etiquetas continuam vinculadas mesmo se você mover os arquivos entre pastas:"
+            )
+            lbl = QtWidgets.QLabel(desc)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #cbd5e1;")
+            layout.addWidget(lbl)
+
+            tag_icons = {
+                "Estudar": "📚",
+                "Trabalho": "💼",
+                "Pessoal": "🏠",
+                "Importante": "⭐",
+                "Temporário": "⏳",
+                "Revisar": "🔍",
+            }
+            self.tag_checks: dict[str, QtWidgets.QCheckBox] = {}
+            existing_set = {t.lower() for t in existing_tags}
+            for tag_name, tag_color in SMART_TAGS_CATALOG:
+                icon = tag_icons.get(tag_name, "🏷️")
+                chk = QtWidgets.QCheckBox(f"{icon} {tag_name}")
+                chk.setChecked(tag_name.lower() in existing_set)
+                chk.setStyleSheet(f"color: {tag_color}; font-weight: 600;")
+                layout.addWidget(chk)
+                self.tag_checks[tag_name] = chk
+
+            layout.addWidget(QtWidgets.QLabel("<b>Ou adicione etiqueta personalizada (opcional):</b>"))
+            self.custom_tag_edit = QtWidgets.QLineEdit()
+            self.custom_tag_edit.setPlaceholderText("Ex: TCC, Imposto2026, Cliente_X...")
+            layout.addWidget(self.custom_tag_edit)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            btn_row.addStretch()
+            btn_cancel = QtWidgets.QPushButton("Cancelar")
+            btn_cancel.clicked.connect(self.reject)
+            btn_row.addWidget(btn_cancel)
+            btn_ok = QtWidgets.QPushButton("💾 Salvar Etiquetas")
+            btn_ok.setObjectName("PrimaryBtn")
+            btn_ok.clicked.connect(self.accept)
+            btn_row.addWidget(btn_ok)
+            layout.addLayout(btn_row)
+
+        def selected_tags(self) -> tuple[list[str], list[str]]:
+            checked: list[str] = []
+            unchecked: list[str] = []
+            for tname, chk in self.tag_checks.items():
+                if chk.isChecked():
+                    checked.append(tname)
+                else:
+                    unchecked.append(tname)
+            custom = self.custom_tag_edit.text().strip()
+            if custom:
+                for part in custom.split(","):
+                    clean = part.strip()
+                    if clean and clean not in checked:
+                        checked.append(clean)
+            return checked, unchecked
+
     class VidaMainWindow(QtWidgets.QMainWindow):
         def __init__(self, ctrl: DesktopController):
             super().__init__()
             self.ctrl = ctrl
             self.current_category_filter = "all"
             self.current_folder_filter: str | None = None
+            self.current_semantic_tag_filter: str | None = None
             self.editing_rule_id: int | None = None
             self.selected_tree_folder_path: str = str(self.ctrl.config.vida_root)
             self.scan_worker: ScanWorker | None = None
@@ -627,6 +735,8 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             root_layout.addWidget(self.tabs, 1)
 
             self._build_queue_tab()
+            self._build_duplicates_tab()
+            self._build_semantic_search_tab()
             self._build_storage_tab()
             self._build_vida_tree_tab()
             self._build_rules_tab()
@@ -731,6 +841,11 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             btn_pin_sel.setToolTip("Mantém os itens selecionados onde estão e nunca mais sugere movê-los")
             btn_pin_sel.clicked.connect(self.on_ignore_selected)
             b_layout.addWidget(btn_pin_sel)
+
+            btn_tag_sel = QtWidgets.QPushButton("🏷️ Etiquetar Selecionados...")
+            btn_tag_sel.setToolTip("Adiciona etiqueta inteligente (Estudar, Trabalho, Importante...) independente da pasta")
+            btn_tag_sel.clicked.connect(self.on_tag_selected_queue_items)
+            b_layout.addWidget(btn_tag_sel)
 
             btn_move_custom = QtWidgets.QPushButton("📁 Mover Selecionados Para...")
             btn_move_custom.clicked.connect(self.on_move_selected_to_folder)
@@ -1131,6 +1246,179 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             layout.addLayout(bottom_split, 1)
             self.tabs.addTab(tab, "📊 Monitor de Armazenamento")
 
+        def _build_duplicates_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            self.lbl_dup_summary = QtWidgets.QLabel(
+                "🔁 <b>Central de Duplicados:</b> Grupos de arquivos idênticos (SHA-256) ou versões semelhantes. "
+                "A versão preservada (🟢) nunca é marcada automaticamente; toda ação nas cópias extras (🟠) é manual e 100% reversível."
+            )
+            self.lbl_dup_summary.setWordWrap(True)
+            self.lbl_dup_summary.setStyleSheet(
+                "background-color: #172554; border: 1px solid #3b82f6; border-radius: 8px; padding: 10px; color: #dbeafe;"
+            )
+            layout.addWidget(self.lbl_dup_summary)
+
+            self.dup_groups_tree = QtWidgets.QTreeWidget()
+            self.dup_groups_tree.setAlternatingRowColors(True)
+            self.dup_groups_tree.setHeaderLabels(
+                [
+                    "Grupo / Cópia (Marque apenas as cópias extras p/ arquivar)",
+                    "Papel (Preservado vs Extra)",
+                    "Tamanho",
+                    "Localização Física Completa",
+                    "Ação Rápida",
+                ]
+            )
+            dh = self.dup_groups_tree.header()
+            dh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.dup_groups_tree.setColumnWidth(0, 340)
+            dh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.dup_groups_tree.setColumnWidth(1, 210)
+            dh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.dup_groups_tree.setColumnWidth(2, 120)
+            dh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            dh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.dup_groups_tree.setColumnWidth(4, 120)
+            layout.addWidget(self.dup_groups_tree, 1)
+
+            dup_bar = QtWidgets.QFrame()
+            dup_bar.setObjectName("BatchBar")
+            d_layout = QtWidgets.QHBoxLayout(dup_bar)
+            d_layout.setContentsMargins(12, 8, 12, 8)
+
+            btn_check_extras = QtWidgets.QPushButton("☑️ Marcar Todas Cópias Extras (🟠)")
+            btn_check_extras.clicked.connect(lambda: self._set_all_dup_extras_checked(True))
+            d_layout.addWidget(btn_check_extras)
+
+            btn_uncheck_extras = QtWidgets.QPushButton("⬜ Desmarcar Todas")
+            btn_uncheck_extras.clicked.connect(lambda: self._set_all_dup_extras_checked(False))
+            d_layout.addWidget(btn_uncheck_extras)
+
+            d_layout.addStretch()
+
+            btn_dup_trash = QtWidgets.QPushButton("🗑️ Enviar Extras Marcadas p/ Lixeira")
+            btn_dup_trash.setObjectName("DangerBtn")
+            btn_dup_trash.clicked.connect(lambda: self.on_archive_selected_duplicates(mode="trash"))
+            d_layout.addWidget(btn_dup_trash)
+
+            btn_dup_archive = QtWidgets.QPushButton("📦 Arquivar Cópias Extras Marcadas (100% Reversível)")
+            btn_dup_archive.setObjectName("PrimaryBtn")
+            btn_dup_archive.clicked.connect(lambda: self.on_archive_selected_duplicates(mode="archive"))
+            d_layout.addWidget(btn_dup_archive)
+
+            layout.addWidget(dup_bar)
+            self.tabs.addTab(tab, "🗂️ Central de Duplicados")
+
+        def _build_semantic_search_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            # Top Search Input Row
+            search_row = QtWidgets.QHBoxLayout()
+            self.semantic_search_input = QtWidgets.QLineEdit()
+            self.semantic_search_input.setPlaceholderText(
+                "🧠 Pesquise por significado: ex. 'aquele PDF sobre estruturas de dados que baixei mês passado'..."
+            )
+            self.semantic_search_input.returnPressed.connect(self.on_run_semantic_search)
+            search_row.addWidget(self.semantic_search_input, 1)
+
+            btn_sem_search = QtWidgets.QPushButton("🔍 Buscar por Significado")
+            btn_sem_search.setObjectName("PrimaryBtn")
+            btn_sem_search.clicked.connect(self.on_run_semantic_search)
+            search_row.addWidget(btn_sem_search)
+
+            btn_sem_clear = QtWidgets.QPushButton("✖ Limpar")
+            btn_sem_clear.clicked.connect(
+                lambda: (
+                    self.semantic_search_input.clear(),
+                    self.set_semantic_tag_filter(None),
+                )
+            )
+            search_row.addWidget(btn_sem_clear)
+            layout.addLayout(search_row)
+
+            # Quick Example Chips + Smart Tags Filter Row
+            tags_row = QtWidgets.QHBoxLayout()
+            tags_row.addWidget(QtWidgets.QLabel("<b>🏷️ Etiquetas Inteligentes:</b>"))
+            self.semantic_tag_pills: dict[str, QtWidgets.QPushButton] = {}
+
+            btn_all_tags = QtWidgets.QPushButton("Todas")
+            btn_all_tags.setObjectName("FilterPill")
+            btn_all_tags.setProperty("active", "true")
+            btn_all_tags.clicked.connect(lambda: self.set_semantic_tag_filter(None))
+            tags_row.addWidget(btn_all_tags)
+            self.semantic_tag_pills["__ALL__"] = btn_all_tags
+
+            tag_icons = {
+                "Estudar": "📚",
+                "Trabalho": "💼",
+                "Pessoal": "🏠",
+                "Importante": "⭐",
+                "Temporário": "⏳",
+                "Revisar": "🔍",
+            }
+            for tag_name, tag_color in SMART_TAGS_CATALOG:
+                icon = tag_icons.get(tag_name, "🏷️")
+                btn_t = QtWidgets.QPushButton(f"{icon} {tag_name}")
+                btn_t.setObjectName("FilterPill")
+                btn_t.setProperty("active", "false")
+                btn_t.setToolTip(f"Filtrar arquivos com etiqueta {tag_name} (independente da pasta)")
+                btn_t.clicked.connect(lambda checked=False, tn=tag_name: self.set_semantic_tag_filter(tn))
+                tags_row.addWidget(btn_t)
+                self.semantic_tag_pills[tag_name] = btn_t
+
+            tags_row.addStretch()
+            layout.addLayout(tags_row)
+
+            self.lbl_semantic_interpretation = QtWidgets.QLabel(
+                "💡 <b>Dica:</b> Combine conceitos, tipos de arquivo, datas (<i>hoje, semana passada, mês passado</i>) e etiquetas inteligentes independentes de pasta."
+            )
+            self.lbl_semantic_interpretation.setWordWrap(True)
+            self.lbl_semantic_interpretation.setStyleSheet(
+                "background-color: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 8px; color: #93c5fd;"
+            )
+            layout.addWidget(self.lbl_semantic_interpretation)
+
+            self.semantic_results_table = QtWidgets.QTableWidget(0, 6)
+            self.semantic_results_table.setAlternatingRowColors(True)
+            self.semantic_results_table.setSelectionBehavior(
+                QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+            )
+            self.semantic_results_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.semantic_results_table.verticalHeader().setVisible(False)
+            self.semantic_results_table.verticalHeader().setDefaultSectionSize(40)
+            self.semantic_results_table.setHorizontalHeaderLabels(
+                [
+                    "Arquivo",
+                    "Etiquetas Inteligentes (🏷️)",
+                    "Significado / Por que combinou",
+                    "Tamanho",
+                    "Localização Atual",
+                    "Ações",
+                ]
+            )
+            sh = self.semantic_results_table.horizontalHeader()
+            sh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.semantic_results_table.setColumnWidth(0, 230)
+            sh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.semantic_results_table.setColumnWidth(1, 210)
+            sh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            sh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.semantic_results_table.setColumnWidth(3, 95)
+            sh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.semantic_results_table.setColumnWidth(4, 240)
+            sh.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.semantic_results_table.setColumnWidth(5, 195)
+            layout.addWidget(self.semantic_results_table, 1)
+
+            self.tabs.addTab(tab, "🧠 Busca Semântica & Etiquetas (🏷️)")
+
         def trigger_async_scan(self):
             if self.scan_worker and self.scan_worker.isRunning():
                 return
@@ -1183,6 +1471,8 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self._render_health_cards()
             self._update_pill_counts()
             self._populate_queue_table()
+            self._populate_duplicates_tab()
+            self.on_run_semantic_search()
             self._populate_storage_tab()
             self._populate_vida_tree()
             self._populate_rules_table()
@@ -1374,6 +1664,14 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     btn_pin.clicked.connect(lambda checked=False, iid=item_id: self.on_ignore_single(iid))
                     act_layout.addWidget(btn_pin)
 
+                    btn_tag = QtWidgets.QPushButton("🏷️")
+                    btn_tag.setFixedWidth(30)
+                    btn_tag.setToolTip("Etiquetar arquivo (Estudar, Trabalho, Importante...)")
+                    btn_tag.clicked.connect(
+                        lambda checked=False, p=item["source_path"]: self._open_tag_dialog([p])
+                    )
+                    act_layout.addWidget(btn_tag)
+
                     btn_exp = QtWidgets.QPushButton("📂")
                     btn_exp.setFixedWidth(30)
                     btn_exp.setToolTip("Mostrar no Windows Explorer")
@@ -1552,6 +1850,235 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             self.ctrl.reset_storage_baseline()
             self.lbl_status.setText("🔄 Linha de base de tamanho das pastas atualizada com sucesso!")
             self.render_all()
+
+        # --- Smart Tags Dialog & Handlers ---
+        def _open_tag_dialog(self, paths: list[str]):
+            if not paths:
+                return
+            existing: list[str] = []
+            if len(paths) == 1:
+                existing = self.ctrl.db.get_tags_for_path(paths[0])
+            dlg = SmartTagDialog(self, paths, existing)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                checked, unchecked = dlg.selected_tags()
+                for p in paths:
+                    for t in checked:
+                        self.ctrl.add_tag(p, t)
+                    if len(paths) == 1:
+                        for t in unchecked:
+                            if t in existing:
+                                self.ctrl.remove_tag(p, t)
+                self.lbl_status.setText(
+                    f"🏷️ Etiquetas atualizadas em {len(paths)} arquivo(s): {', '.join(checked) or 'nenhuma'}."
+                )
+                self.on_run_semantic_search()
+
+        def on_tag_selected_queue_items(self):
+            ids = set(self.get_selected_item_ids())
+            if not ids:
+                self.lbl_status.setText("⚠️ Marque pelo menos 1 item na coluna [✓] para etiquetar.")
+                return
+            paths = [
+                i["source_path"]
+                for i in self.ctrl.state.get("queue", [])
+                if i["id"] in ids
+            ]
+            self._open_tag_dialog(paths)
+
+        # --- Central de Duplicados Tab Logic ---
+        def _populate_duplicates_tab(self):
+            self.dup_groups_tree.clear()
+            groups = self.ctrl.state.get("duplicate_groups", [])
+            total_wasted = sum(int(g.get("wasted_bytes", 0)) for g in groups)
+            self.lbl_dup_summary.setText(
+                f"🔁 <b>Central de Duplicados:</b> <b>{len(groups)}</b> grupo(s) encontrado(s) · "
+                f"Espaço recuperável estimado: <b>{format_bytes(total_wasted)}</b>. "
+                "A versão preservada (🟢) nunca é tocada; toda ação nas cópias extras (🟠) é manual e 100% reversível."
+            )
+
+            for grp in groups:
+                grp_item = QtWidgets.QTreeWidgetItem(
+                    [
+                        f"🔁 {grp['title']} ({grp['copy_count']} cópias)",
+                        grp.get("group_label", "Duplicado"),
+                        f"{format_bytes(grp['total_bytes'])} (economiza {format_bytes(grp['wasted_bytes'])})",
+                        f"Preservado em: {grp['keeper']['folder']}",
+                        "",
+                    ]
+                )
+                font_bold = grp_item.font(0)
+                font_bold.setBold(True)
+                grp_item.setFont(0, font_bold)
+                grp_item.setForeground(2, QtGui.QColor("#f59e0b"))
+                self.dup_groups_tree.addTopLevelItem(grp_item)
+
+                # Child 0: Keeper (Preserved, NOT checkable)
+                keeper = grp["keeper"]
+                keep_item = QtWidgets.QTreeWidgetItem(
+                    [
+                        f"🟢 {keeper['name']}",
+                        f"🟢 Preservado · {keeper.get('reason', '')}",
+                        format_bytes(int(keeper.get("size_bytes", 0))),
+                        keeper["path"],
+                        "",
+                    ]
+                )
+                keep_item.setForeground(0, QtGui.QColor("#10b981"))
+                keep_item.setForeground(1, QtGui.QColor("#10b981"))
+                keep_item.setToolTip(3, keeper["path"])
+                grp_item.addChild(keep_item)
+
+                kw_w = QtWidgets.QWidget()
+                kw_l = QtWidgets.QHBoxLayout(kw_w)
+                kw_l.setContentsMargins(2, 2, 2, 2)
+                btn_k_open = QtWidgets.QPushButton("📂 Abrir")
+                btn_k_open.clicked.connect(lambda checked=False, p=keeper["path"]: self.ctrl.open_in_explorer(p))
+                kw_l.addWidget(btn_k_open)
+                self.dup_groups_tree.setItemWidget(keep_item, 4, kw_w)
+
+                # Children 1..N: Extras (Checkable, manual action)
+                for ex in grp.get("extras", []):
+                    ex_item = QtWidgets.QTreeWidgetItem(
+                        [
+                            f"🟠 {ex['name']}",
+                            f"🟠 Cópia Extra · {ex.get('reason', '')}",
+                            format_bytes(int(ex.get("size_bytes", 0))),
+                            ex["path"],
+                            "",
+                        ]
+                    )
+                    ex_item.setFlags(
+                        QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                        | QtCore.Qt.ItemFlag.ItemIsEnabled
+                        | QtCore.Qt.ItemFlag.ItemIsSelectable
+                    )
+                    ex_item.setCheckState(0, QtCore.Qt.CheckState.Unchecked)
+                    ex_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ex["path"])
+                    ex_item.setForeground(0, QtGui.QColor("#fbbf24"))
+                    ex_item.setForeground(1, QtGui.QColor("#f59e0b"))
+                    ex_item.setToolTip(3, ex["path"])
+                    grp_item.addChild(ex_item)
+
+                    ew_w = QtWidgets.QWidget()
+                    ew_l = QtWidgets.QHBoxLayout(ew_w)
+                    ew_l.setContentsMargins(2, 2, 2, 2)
+                    btn_e_open = QtWidgets.QPushButton("📂 Abrir")
+                    btn_e_open.clicked.connect(lambda checked=False, p=ex["path"]: self.ctrl.open_in_explorer(p))
+                    ew_l.addWidget(btn_e_open)
+                    self.dup_groups_tree.setItemWidget(ex_item, 4, ew_w)
+
+            self.dup_groups_tree.expandAll()
+
+        def _set_all_dup_extras_checked(self, checked: bool):
+            state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
+            for i in range(self.dup_groups_tree.topLevelItemCount()):
+                grp_item = self.dup_groups_tree.topLevelItem(i)
+                for j in range(grp_item.childCount()):
+                    ch = grp_item.child(j)
+                    if ch.data(0, QtCore.Qt.ItemDataRole.UserRole):
+                        ch.setCheckState(0, state)
+
+        def _get_checked_dup_extra_paths(self) -> list[str]:
+            paths: list[str] = []
+            for i in range(self.dup_groups_tree.topLevelItemCount()):
+                grp_item = self.dup_groups_tree.topLevelItem(i)
+                for j in range(grp_item.childCount()):
+                    ch = grp_item.child(j)
+                    p = ch.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                    if p and ch.checkState(0) == QtCore.Qt.CheckState.Checked:
+                        paths.append(str(p))
+            return paths
+
+        def on_archive_selected_duplicates(self, mode: str = "archive"):
+            paths = self._get_checked_dup_extra_paths()
+            if not paths:
+                self.lbl_status.setText("⚠️ Marque pelo menos uma cópia extra (🟠) na Central de Duplicados.")
+                return
+            res = self.ctrl.archive_duplicates(paths, mode=mode)
+            action_lbl = "enviada(s) para a Lixeira" if mode == "trash" else "arquivada(s) em 04_Arquivo_Morto/Duplicados_Arquivados"
+            self.lbl_status.setText(
+                f"🔁 {res['executed_count']} cópia(s) extra(s) {action_lbl} (Reversível em 1 clique via Desfazer!)."
+            )
+            self.render_all()
+
+        # --- Semantic Search & Smart Tags Tab Logic ---
+        def set_semantic_tag_filter(self, tag: str | None):
+            self.current_semantic_tag_filter = tag
+            active_key = tag or "__ALL__"
+            for key, btn in self.semantic_tag_pills.items():
+                btn.setProperty("active", "true" if key == active_key else "false")
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+            self.on_run_semantic_search()
+
+        def on_run_semantic_search(self):
+            query = self.semantic_search_input.text().strip()
+            payload = self.ctrl.semantic_search(query, tag_filter=self.current_semantic_tag_filter)
+            parsed = payload.get("parsed", {})
+            results = payload.get("results", [])
+
+            # Update interpretation bar
+            hints: list[str] = []
+            if parsed.get("wanted_exts"):
+                hints.append(f"Tipos: {', '.join(sorted(parsed['wanted_exts']))}")
+            if parsed.get("time_label"):
+                hints.append(f"Período: {parsed['time_label']}")
+            if parsed.get("expanded_terms"):
+                hints.append(f"Conceitos: {', '.join(sorted(parsed['expanded_terms'])[:5])}")
+            if self.current_semantic_tag_filter:
+                hints.append(f"Etiqueta: {self.current_semantic_tag_filter}")
+
+            hint_str = " · ".join(hints) if hints else "Busca contextual em nomes, pastas, tags e trechos"
+            self.lbl_semantic_interpretation.setText(
+                f"🧠 <b>{len(results)}</b> resultado(s) — <i>{hint_str}</i>"
+            )
+
+            self.semantic_results_table.setRowCount(len(results))
+            for idx, r in enumerate(results):
+                name_it = QtWidgets.QTableWidgetItem(f"📄 {r['name']}")
+                name_it.setToolTip(r["path"])
+                f_b = name_it.font()
+                f_b.setBold(True)
+                name_it.setFont(f_b)
+                self.semantic_results_table.setItem(idx, 0, name_it)
+
+                tags = r.get("tags", [])
+                exp_tags = set(r.get("explicit_tags", []))
+                tags_disp = ", ".join(
+                    f"🏷️ {t}" if t in exp_tags else f"✨ {t}" for t in tags
+                ) or "— (sem etiqueta)"
+                tag_it = QtWidgets.QTableWidgetItem(tags_disp)
+                tag_it.setForeground(QtGui.QColor("#38bdf8" if exp_tags else "#94a3b8"))
+                self.semantic_results_table.setItem(idx, 1, tag_it)
+
+                reason_txt = f"[{r.get('score', 0)}%] {r.get('match_reason', '')} · {r.get('modified_date', '')}"
+                self.semantic_results_table.setItem(idx, 2, QtWidgets.QTableWidgetItem(reason_txt))
+
+                sz_it = SizeSortableItem(format_bytes(int(r.get("size_bytes", 0))))
+                sz_it.setData(QtCore.Qt.ItemDataRole.UserRole, int(r.get("size_bytes", 0)))
+                self.semantic_results_table.setItem(idx, 3, sz_it)
+
+                loc_it = QtWidgets.QTableWidgetItem(r["folder"])
+                loc_it.setToolTip(r["path"])
+                loc_it.setForeground(QtGui.QColor("#cbd5e1"))
+                self.semantic_results_table.setItem(idx, 4, loc_it)
+
+                act_w = QtWidgets.QWidget()
+                act_l = QtWidgets.QHBoxLayout(act_w)
+                act_l.setContentsMargins(4, 2, 4, 2)
+                act_l.setSpacing(4)
+
+                btn_tag = QtWidgets.QPushButton("🏷️ Etiquetar")
+                btn_tag.clicked.connect(lambda checked=False, p=r["path"]: self._open_tag_dialog([p]))
+                act_l.addWidget(btn_tag)
+
+                btn_open = QtWidgets.QPushButton("📂")
+                btn_open.setFixedWidth(34)
+                btn_open.setToolTip("Abrir no Windows Explorer")
+                btn_open.clicked.connect(lambda checked=False, p=r["path"]: self.ctrl.open_in_explorer(p))
+                act_l.addWidget(btn_open)
+
+                self.semantic_results_table.setCellWidget(idx, 5, act_w)
 
         def _populate_storage_tab(self):
             mon = self.ctrl.state.get("storage_monitor", {})
