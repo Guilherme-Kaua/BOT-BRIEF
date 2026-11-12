@@ -76,8 +76,21 @@ def execute_queue_items(
                     )
                     continue
                 final_dst = resolve_collision_path(dst, src)
+                try:
+                    sz = src.stat().st_size if src.is_file() else 0
+                except OSError:
+                    sz = int(item.get("size_bytes", 0))
                 shutil.move(str(src), str(final_dst))
                 db.relocate_file_tags(str(src), str(final_dst))
+                db.record_file_movement(
+                    str(src),
+                    str(final_dst),
+                    rule_name=item.get("rule_name", ""),
+                    reason=item.get("reason", "Movimentação automática/manual"),
+                    event_type="rename" if cat == "renomear_sugerido" else "move",
+                )
+                if item.get("id"):
+                    db.clear_triage_state(str(item["id"]))
 
                 # Ensure parent folder inside F:\Vida has its Folcolor icon applied
                 if needs_folcolor_icon(final_dst.parent, config.vida_root, config.folcolor_exe):
@@ -91,6 +104,7 @@ def execute_queue_items(
                         "action_type": action_type,
                         "source_path": str(src),
                         "target_path": str(final_dst),
+                        "size_bytes": sz,
                         "meta_json": json.dumps({"rule_name": item.get("rule_name", "")}, ensure_ascii=False),
                     }
                 )
@@ -143,13 +157,27 @@ def execute_queue_items(
                     )
                     archive_dst.parent.mkdir(parents=True, exist_ok=True)
                     final_dst = resolve_collision_path(archive_dst, src)
+                    try:
+                        sz = src.stat().st_size if src.is_file() else 0
+                    except OSError:
+                        sz = int(item.get("size_bytes", 0))
                     shutil.move(str(src), str(final_dst))
                     db.relocate_file_tags(str(src), str(final_dst))
+                    db.record_file_movement(
+                        str(src),
+                        str(final_dst),
+                        rule_name=item.get("rule_name", "Arquivo Morto"),
+                        reason=item.get("reason", "Arquivado de forma reversível"),
+                        event_type="archive",
+                    )
+                    if item.get("id"):
+                        db.clear_triage_state(str(item["id"]))
                     executed_records.append(
                         {
                             "action_type": "archive",
                             "source_path": str(src),
                             "target_path": str(final_dst),
+                            "size_bytes": sz,
                             "meta_json": "{}",
                         }
                     )
@@ -201,6 +229,13 @@ def undo_batch(batch_id: int, db: Database) -> dict:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(dst), str(src))
                 db.relocate_file_tags(str(dst), str(src))
+                db.record_file_movement(
+                    str(dst),
+                    str(src),
+                    rule_name="Undo",
+                    reason=f"Restaurado pelo Desfazer Lote #{batch_id}",
+                    event_type="undo",
+                )
                 undone_count += 1
                 details.append({"source_path": str(src), "status": "restored"})
             elif action_type == "icon":

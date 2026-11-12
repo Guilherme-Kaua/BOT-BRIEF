@@ -259,6 +259,8 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
     except OSError:
         c_free_bytes = 0
 
+    storage_mon = analyze_storage(config, db, now_ts=current_ts)
+    dup_groups = build_duplicate_groups(config)
     return {
         "summary": {
             "total_disorganized": len(queue),
@@ -270,9 +272,13 @@ def scan_all(config: AppConfig, db: Database, now_ts: float | None = None) -> di
         "queue": queue,
         "vida_tree": build_vida_tree(config.vida_root, config.folcolor_exe, queue),
         "ignored_paths": db.list_ignored_paths(),
-        "storage_monitor": analyze_storage(config, db, now_ts=current_ts),
-        "duplicate_groups": build_duplicate_groups(config),
+        "storage_monitor": storage_mon,
+        "duplicate_groups": dup_groups,
         "tagged_files": db.list_files_by_tag(),
+        "file_memories": db.list_file_memories(limit=150),
+        "rule_suggestions": db.list_rule_suggestions(min_occurrences=2),
+        "triage_states": db.get_triage_states_map(),
+        "workspaces": db.list_workspaces(),
     }
 
 

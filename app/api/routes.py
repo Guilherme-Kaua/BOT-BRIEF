@@ -11,6 +11,18 @@ from app.config import AppConfig
 from app.db import Database
 from app.engine.duplicates import archive_duplicate_extras, build_duplicate_groups
 from app.engine.executor import execute_queue_items, undo_batch
+from app.engine.explorer_integration import (
+    build_context_menu_spec,
+    install_context_menu,
+    is_context_menu_installed,
+    uninstall_context_menu,
+)
+from app.engine.reporting_catalog_vault import (
+    build_app_catalog,
+    build_organization_report,
+    export_config_vault,
+    import_config_vault,
+)
 from app.engine.scanner import _build_folder_cards, scan_all
 from app.engine.semantic_search import SMART_TAGS_CATALOG, parse_natural_query, semantic_search_files
 from app.engine.storage_monitor import analyze_storage
@@ -63,6 +75,38 @@ class ArchiveDuplicatesRequest(BaseModel):
 class TagActionRequest(BaseModel):
     path: str
     tag: str
+
+
+class LearningDecisionRequest(BaseModel):
+    signature_key: str
+    folcolor_index: int = 9
+
+
+class TriageStateRequest(BaseModel):
+    item_id: str
+    column_name: str
+    custom_name: str | None = None
+    custom_target: str | None = None
+
+
+class WorkspaceActivateRequest(BaseModel):
+    name: str
+
+
+class WorkspacePayload(BaseModel):
+    id: int | None = None
+    name: str
+    icon: str = "📁"
+    color: str = "#3b82f6"
+    description: str = ""
+    favorite_folders: list[str] = []
+    keywords: list[str] = []
+    shortcuts: list[dict[str, str]] = []
+
+
+class VaultRequest(BaseModel):
+    zip_path: str
+    options: dict[str, bool] = {}
 
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
@@ -222,6 +266,97 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "files": db.list_files_by_tag(),
         }
 
+    # --- 13. Memória dos arquivos ---
+    @app.get("/api/file-memory")
+    def api_file_memory(q: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        return db.list_file_memories(limit=limit, search=q)
+
+    # --- 14. Aprendizado com decisões ---
+    @app.get("/api/learning/suggestions")
+    def api_learning_suggestions() -> dict[str, Any]:
+        return {
+            "suggestions": db.list_rule_suggestions(min_occurrences=2),
+            "feedback_history": db.list_decision_feedback(limit=50),
+        }
+
+    @app.post("/api/learning/accept")
+    def api_learning_accept(req: LearningDecisionRequest) -> dict[str, Any]:
+        rule_id = db.accept_suggested_rule(req.signature_key, folcolor_index=req.folcolor_index)
+        return {
+            "rule_id": rule_id,
+            "suggestions": db.list_rule_suggestions(min_occurrences=2),
+            "scan": _get_or_refresh_scan(force=True),
+        }
+
+    @app.post("/api/learning/dismiss")
+    def api_learning_dismiss(req: LearningDecisionRequest) -> dict[str, Any]:
+        db.dismiss_rule_suggestion(req.signature_key)
+        return {"suggestions": db.list_rule_suggestions(min_occurrences=2)}
+
+    # --- 15. Inbox Zero Kanban ---
+    @app.post("/api/inbox-zero/state")
+    def api_set_triage_state(req: TriageStateRequest) -> dict[str, Any]:
+        db.set_triage_state(
+            req.item_id,
+            req.column_name,
+            custom_name=req.custom_name,
+            custom_target=req.custom_target,
+        )
+        return {"triage_states": db.get_triage_states_map()}
+
+    # --- 16. Integração com Windows Explorer ---
+    @app.get("/api/explorer/status")
+    def api_explorer_status() -> dict[str, Any]:
+        return {
+            "installed": is_context_menu_installed(),
+            "spec": build_context_menu_spec(),
+        }
+
+    @app.post("/api/explorer/install")
+    def api_explorer_install() -> dict[str, Any]:
+        return install_context_menu()
+
+    @app.post("/api/explorer/uninstall")
+    def api_explorer_uninstall() -> dict[str, Any]:
+        return uninstall_context_menu()
+
+    # --- 17. Espaços de trabalho ---
+    @app.get("/api/workspaces")
+    def api_list_workspaces() -> list[dict[str, Any]]:
+        return db.list_workspaces()
+
+    @app.post("/api/workspaces/activate")
+    def api_activate_workspace(req: WorkspaceActivateRequest) -> dict[str, Any]:
+        ws = db.set_active_workspace(req.name)
+        return {"active": ws, "workspaces": db.list_workspaces()}
+
+    @app.post("/api/workspaces")
+    def api_upsert_workspace(req: WorkspacePayload) -> dict[str, Any]:
+        ws_id = db.upsert_workspace(req.model_dump())
+        return {"id": ws_id, "workspaces": db.list_workspaces()}
+
+    # --- 18. Relatório de Organização ---
+    @app.get("/api/report")
+    def api_organization_report(period_days: int = 7) -> dict[str, Any]:
+        report = _get_or_refresh_scan(force=False)
+        return build_organization_report(cfg, db, period_days=period_days, scan_state=report)
+
+    # --- 19. Gerenciador de Aplicativos e Ferramentas ---
+    @app.get("/api/apps")
+    def api_app_catalog(include_registry: int = 1) -> list[dict[str, Any]]:
+        return build_app_catalog(cfg, include_registry=bool(include_registry))
+
+    # --- 20. Cofre de Configurações ---
+    @app.post("/api/vault/export")
+    def api_vault_export(req: VaultRequest) -> dict[str, Any]:
+        return export_config_vault(Path(req.zip_path), db, cfg, options=req.options)
+
+    @app.post("/api/vault/import")
+    def api_vault_import(req: VaultRequest) -> dict[str, Any]:
+        res = import_config_vault(Path(req.zip_path), db, cfg, options=req.options)
+        res["scan"] = _get_or_refresh_scan(force=True)
+        return res
+
     @app.post("/api/toggle-watch")
     def api_toggle_watch() -> dict[str, Any]:
         app.state.auto_watch_enabled = not app.state.auto_watch_enabled
@@ -245,13 +380,25 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         report = _get_or_refresh_scan(force=False)
         for item in report["queue"]:
             if item["id"] == item_id:
-                item["target_path"] = str(Path(req.target_path))
+                old_target = item.get("target_path", "")
+                old_rule = item.get("rule_name", "")
+                new_dst = str(Path(req.target_path))
+                if old_target and Path(old_target).parent != Path(new_dst).parent:
+                    db.record_user_correction(
+                        item["source_path"],
+                        old_target,
+                        old_rule,
+                        new_dst,
+                        vida_root=cfg.vida_root,
+                    )
+                item["target_path"] = new_dst
                 if req.category:
                     item["category"] = req.category
                 elif item["category"] == "espaco_recuperavel":
                     item["category"] = "pronto_para_mover"
                 item["reason"] = f"Destino personalizado → {Path(req.target_path).name}"
                 item["rule_name"] = "Edição Manual"
+                report["rule_suggestions"] = db.list_rule_suggestions(min_occurrences=2)
                 return {"updated": item, "scan": _enrich_scan(report)}
         raise HTTPException(status_code=404, detail="Item não encontrado na fila")
 
@@ -264,9 +411,18 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         for item in report["queue"]:
             if item["id"] in wanted:
                 src_name = Path(item["source_path"]).name
+                new_dst = str(dest_dir / src_name)
+                if item.get("target_path") and Path(item["target_path"]).parent != dest_dir:
+                    db.record_user_correction(
+                        item["source_path"],
+                        item["target_path"],
+                        item.get("rule_name", ""),
+                        new_dst,
+                        vida_root=cfg.vida_root,
+                    )
                 cloned = dict(item)
                 cloned["category"] = "pronto_para_mover"
-                cloned["target_path"] = str(dest_dir / src_name)
+                cloned["target_path"] = new_dst
                 cloned["rule_name"] = f"Movido em lote p/ {dest_dir.name}"
                 custom_items.append(cloned)
         res = execute_queue_items(custom_items, db, cfg, include_destructive_trash=False)

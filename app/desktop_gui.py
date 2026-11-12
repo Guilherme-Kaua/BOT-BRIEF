@@ -9,7 +9,20 @@ from app.config import AppConfig
 from app.db import Database
 from app.engine.duplicates import archive_duplicate_extras, build_duplicate_groups
 from app.engine.executor import execute_queue_items, undo_batch
+from app.engine.explorer_integration import (
+    build_context_menu_spec,
+    install_context_menu,
+    is_context_menu_installed,
+    uninstall_context_menu,
+)
 from app.engine.folcolor import apply_folcolor_icon, build_vida_tree
+from app.engine.reporting_catalog_vault import (
+    build_app_catalog,
+    build_organization_report,
+    export_config_vault,
+    format_report_markdown,
+    import_config_vault,
+)
 from app.engine.scanner import _build_folder_cards, scan_all
 from app.engine.semantic_search import (
     SMART_TAGS_CATALOG,
@@ -78,7 +91,96 @@ class DesktopController:
         if "duplicate_groups" not in self.state:
             self.state["duplicate_groups"] = build_duplicate_groups(self.config)
         self.state["tagged_files"] = self.db.list_files_by_tag()
+        self.state["file_memories"] = self.db.list_file_memories(limit=150)
+        self.state["rule_suggestions"] = self.db.list_rule_suggestions(min_occurrences=2)
+        self.state["triage_states"] = self.db.get_triage_states_map()
+        self.state["workspaces"] = self.db.list_workspaces()
         return self.state
+
+    # --- 13. File Memory ---
+    def get_file_memories(self, search: str = "") -> list[dict[str, Any]]:
+        mems = self.db.list_file_memories(limit=200, search=search)
+        if not search:
+            self.state["file_memories"] = mems
+        return mems
+
+    # --- 14. Decision Learning ---
+    def accept_rule_suggestion(self, signature_key: str, folcolor_index: int = 9) -> int | None:
+        rid = self.db.accept_suggested_rule(signature_key, folcolor_index=folcolor_index)
+        self.refresh(force=True)
+        return rid
+
+    def dismiss_rule_suggestion(self, signature_key: str) -> None:
+        self.db.dismiss_rule_suggestion(signature_key)
+        self.state["rule_suggestions"] = self.db.list_rule_suggestions(min_occurrences=2)
+
+    # --- 15. Inbox Zero Kanban ---
+    def set_kanban_column(
+        self,
+        item_id: str,
+        column_name: str,
+        custom_name: str | None = None,
+        custom_target: str | None = None,
+    ) -> dict[str, Any]:
+        self.db.set_triage_state(item_id, column_name, custom_name=custom_name, custom_target=custom_target)
+        t_map = self.db.get_triage_states_map()
+        self.state["triage_states"] = t_map
+        return t_map
+
+    # --- 16. Explorer Integration ---
+    def get_explorer_status(self) -> dict[str, Any]:
+        return {"installed": is_context_menu_installed(), "spec": build_context_menu_spec()}
+
+    def install_explorer_menu(self) -> dict[str, Any]:
+        return install_context_menu()
+
+    def uninstall_explorer_menu(self) -> dict[str, Any]:
+        return uninstall_context_menu()
+
+    # --- 17. Workspaces ---
+    def activate_workspace(self, name: str | None) -> dict[str, Any] | None:
+        if not name or name == "__ALL__":
+            with self.db._connect() as conn:
+                conn.execute("UPDATE workspaces SET is_active = 0")
+                conn.commit()
+            self.state["workspaces"] = self.db.list_workspaces()
+            return None
+        ws = self.db.set_active_workspace(name)
+        self.state["workspaces"] = self.db.list_workspaces()
+        return ws
+
+    def get_active_workspace(self) -> dict[str, Any] | None:
+        for w in self.state.get("workspaces") or self.db.list_workspaces():
+            if w.get("is_active"):
+                return w
+        return None
+
+    # --- 18. Organization Report ---
+    def get_organization_report(self, period_days: int = 7) -> dict[str, Any]:
+        return build_organization_report(
+            self.config,
+            self.db,
+            period_days=period_days,
+            scan_state=self.state or None,
+        )
+
+    def get_organization_report_markdown(self, period_days: int = 7) -> str:
+        return format_report_markdown(self.get_organization_report(period_days=period_days))
+
+    # --- 19. App & Tools Catalog ---
+    def get_app_catalog(self, include_registry: bool = True) -> list[dict[str, Any]]:
+        apps = build_app_catalog(self.config, include_registry=include_registry)
+        self.state["app_catalog"] = apps
+        return apps
+
+    # --- 20. Config Vault ---
+    def export_vault(self, zip_path: str, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        return export_config_vault(Path(zip_path), self.db, self.config, options=options)
+
+    def import_vault(self, zip_path: str, options: dict[str, bool] | None = None) -> dict[str, Any]:
+        res = import_config_vault(Path(zip_path), self.db, self.config, options=options)
+        self.refresh(force=True)
+        return res
 
     def archive_duplicates(self, extra_paths: list[str], mode: str = "archive") -> dict[str, Any]:
         res = archive_duplicate_extras(extra_paths, self.db, self.config, mode=mode)
@@ -126,7 +228,19 @@ class DesktopController:
             self.refresh(force=True)
         for item in self.state.get("queue", []):
             if item["id"] == item_id:
-                item["target_path"] = str(Path(new_target_path))
+                old_target = item.get("target_path", "")
+                old_rule = item.get("rule_name", "")
+                new_dst = str(Path(new_target_path))
+                if old_target and Path(old_target).parent != Path(new_dst).parent:
+                    self.db.record_user_correction(
+                        item["source_path"],
+                        old_target,
+                        old_rule,
+                        new_dst,
+                        vida_root=self.config.vida_root,
+                    )
+                    self.state["rule_suggestions"] = self.db.list_rule_suggestions(min_occurrences=2)
+                item["target_path"] = new_dst
                 if new_category:
                     item["category"] = new_category
                 elif item["category"] == "espaco_recuperavel":
@@ -251,11 +365,21 @@ class DesktopController:
         for item in self.state.get("queue", []):
             if item["id"] in wanted:
                 src_name = Path(item["source_path"]).name
+                new_dst = str(dest_dir / src_name)
+                if item.get("target_path") and Path(item["target_path"]).parent != dest_dir:
+                    self.db.record_user_correction(
+                        item["source_path"],
+                        item["target_path"],
+                        item.get("rule_name", ""),
+                        new_dst,
+                        vida_root=self.config.vida_root,
+                    )
                 cloned = dict(item)
                 cloned["category"] = "pronto_para_mover"
-                cloned["target_path"] = str(dest_dir / src_name)
+                cloned["target_path"] = new_dst
                 cloned["rule_name"] = f"Movido em lote p/ {dest_dir.name}"
                 custom_items.append(cloned)
+        self.state["rule_suggestions"] = self.db.list_rule_suggestions(min_occurrences=2)
         res = execute_queue_items(
             custom_items,
             self.db,
@@ -294,6 +418,8 @@ class DesktopController:
             )
         self.state["last_undoable_batch"] = self.db.get_last_undoable_batch()
         self.state["history"] = self.db.list_batches(limit=25)
+        self.state["file_memories"] = self.db.list_file_memories(limit=150)
+        self.state["triage_states"] = self.db.get_triage_states_map()
 
     def undo_last(self, batch_id: int | None = None) -> dict[str, Any]:
         target_id = batch_id
@@ -481,7 +607,11 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
 """
 
 
-def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool = True):
+def create_desktop_window(
+    config: AppConfig | None = None,
+    auto_scan_async: bool = True,
+    initial_tab: int = 0,
+):
     from PySide6 import QtCore, QtGui, QtWidgets
 
     class SizeSortableItem(QtWidgets.QTableWidgetItem):
@@ -658,6 +788,34 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                         checked.append(clean)
             return checked, unchecked
 
+    class KanbanListWidget(QtWidgets.QListWidget):
+        item_dropped_to_column = QtCore.Signal(str, str)
+
+        def __init__(self, column_name: str, parent=None):
+            super().__init__(parent)
+            self.column_name = column_name
+            self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.setDragEnabled(True)
+            self.setAcceptDrops(True)
+            self.setDropIndicatorShown(True)
+            self.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.DragDrop)
+            self.setDefaultDropAction(QtCore.Qt.DropAction.MoveAction)
+            self.setSpacing(6)
+
+        def dropEvent(self, event: QtGui.QDropEvent):
+            src_widget = event.source()
+            if isinstance(src_widget, KanbanListWidget):
+                moved_ids: list[str] = []
+                for it in src_widget.selectedItems():
+                    iid = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                    if iid:
+                        moved_ids.append(iid)
+                super().dropEvent(event)
+                for iid in moved_ids:
+                    self.item_dropped_to_column.emit(iid, self.column_name)
+                return
+            super().dropEvent(event)
+
     class VidaMainWindow(QtWidgets.QMainWindow):
         def __init__(self, ctrl: DesktopController):
             super().__init__()
@@ -723,6 +881,14 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             root_layout.addWidget(header)
 
+            # 1b. Workspaces Bar (17. Espaços de Trabalho)
+            ws_bar = QtWidgets.QFrame()
+            ws_bar.setObjectName("BatchBar")
+            self.ws_layout = QtWidgets.QHBoxLayout(ws_bar)
+            self.ws_layout.setContentsMargins(12, 6, 12, 6)
+            self.ws_layout.setSpacing(8)
+            root_layout.addWidget(ws_bar)
+
             # 2. Health Cards Row
             self.cards_container = QtWidgets.QWidget()
             self.cards_layout = QtWidgets.QHBoxLayout(self.cards_container)
@@ -732,15 +898,27 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             # 3. Main Tabs
             self.tabs = QtWidgets.QTabWidget()
+            self.tabs.setUsesScrollButtons(True)
+            self.tabs.setElideMode(QtCore.Qt.TextElideMode.ElideNone)
             root_layout.addWidget(self.tabs, 1)
 
             self._build_queue_tab()
+            self._build_inbox_zero_tab()
             self._build_duplicates_tab()
             self._build_semantic_search_tab()
+            self._build_memory_learning_tab()
             self._build_storage_tab()
+            self._build_report_tab()
+            self._build_apps_tab()
             self._build_vida_tree_tab()
             self._build_rules_tab()
+            self._build_explorer_vault_tab()
             self._build_history_tab()
+            self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        def _on_tab_changed(self, index: int):
+            if "Apps" in self.tabs.tabText(index) and "app_catalog" not in self.ctrl.state:
+                self.on_refresh_app_catalog()
 
         def _build_queue_tab(self):
             tab = QtWidgets.QWidget()
@@ -1419,6 +1597,358 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
 
             self.tabs.addTab(tab, "🧠 Busca Semântica & Etiquetas (🏷️)")
 
+        def _build_inbox_zero_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            info = QtWidgets.QLabel(
+                "📥 <b>Inbox Zero (Triagem Kanban em 3 Colunas):</b> Arraste arquivos entre as colunas, "
+                "dê duplo-clique para renomear ou escolher destino e selecione vários cards para executar em lote."
+            )
+            info.setWordWrap(True)
+            info.setStyleSheet(
+                "background-color: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px; color: #cbd5e1;"
+            )
+            layout.addWidget(info)
+
+            cols_row = QtWidgets.QHBoxLayout()
+            cols_row.setSpacing(12)
+            self.kanban_lists: dict[str, KanbanListWidget] = {}
+            self.kanban_headers: dict[str, QtWidgets.QLabel] = {}
+
+            col_specs = [
+                ("entrada", "🗂️ Entrada (Arquivos Novos)", "#f59e0b"),
+                ("em_analise", "🔍 Em Análise (Aguardando Decisão)", "#3b82f6"),
+                ("organizado", "✅ Organizado (Destino Confirmado)", "#10b981"),
+            ]
+            for col_key, title, col_hex in col_specs:
+                col_card = QtWidgets.QFrame()
+                col_card.setObjectName("SurfaceCard")
+                col_card.setStyleSheet(
+                    f"QFrame#SurfaceCard {{ background-color: #111827; border-top: 3px solid {col_hex}; border-radius: 8px; }}"
+                )
+                cl = QtWidgets.QVBoxLayout(col_card)
+                cl.setContentsMargins(10, 10, 10, 10)
+                cl.setSpacing(8)
+
+                lbl = QtWidgets.QLabel(f"<b>{title}</b>")
+                lbl.setStyleSheet(f"color: {col_hex}; font-size: 13px;")
+                cl.addWidget(lbl)
+                self.kanban_headers[col_key] = lbl
+
+                lst = KanbanListWidget(col_key)
+                lst.item_dropped_to_column.connect(self.on_kanban_item_dropped)
+                lst.itemDoubleClicked.connect(self.on_kanban_double_clicked)
+                cl.addWidget(lst, 1)
+                self.kanban_lists[col_key] = lst
+
+                move_row = QtWidgets.QHBoxLayout()
+                if col_key != "entrada":
+                    b_left = QtWidgets.QPushButton("⬅ Mover p/ Esquerda")
+                    prev_col = "entrada" if col_key == "em_analise" else "em_analise"
+                    b_left.clicked.connect(lambda checked=False, src=col_key, dst=prev_col: self.on_kanban_move_selected(src, dst))
+                    move_row.addWidget(b_left)
+                if col_key != "organizado":
+                    b_right = QtWidgets.QPushButton("Mover p/ Direita ➡")
+                    next_col = "em_analise" if col_key == "entrada" else "organizado"
+                    b_right.clicked.connect(lambda checked=False, src=col_key, dst=next_col: self.on_kanban_move_selected(src, dst))
+                    move_row.addWidget(b_right)
+                cl.addLayout(move_row)
+
+                cols_row.addWidget(col_card, 1)
+
+            layout.addLayout(cols_row, 1)
+
+            bar = QtWidgets.QFrame()
+            bar.setObjectName("BatchBar")
+            bl = QtWidgets.QHBoxLayout(bar)
+            bl.setContentsMargins(12, 8, 12, 8)
+            btn_edit_k = QtWidgets.QPushButton("✏️ Editar Nome/Destino Selecionado")
+            btn_edit_k.clicked.connect(self.on_kanban_edit_selected)
+            bl.addWidget(btn_edit_k)
+            bl.addStretch()
+            btn_exec_confirmed = QtWidgets.QPushButton("⚡ Executar Todos na Coluna 'Organizado' (Confirmados)")
+            btn_exec_confirmed.setObjectName("PrimaryBtn")
+            btn_exec_confirmed.clicked.connect(self.on_kanban_execute_confirmed)
+            bl.addWidget(btn_exec_confirmed)
+            layout.addWidget(bar)
+
+            self.tabs.addTab(tab, "📥 Inbox Zero")
+
+        def _build_memory_learning_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            # Top: 14. Decision Learning (Sugestões de novas regras baseadas em correções)
+            learn_lbl = QtWidgets.QLabel(
+                "<b>🧠 Aprendizado com Suas Decisões</b> — Quando você corrige o destino de um item manualmente, "
+                "o BOT-BRIEF aprende o padrão e sugere uma regra aqui (<b>nunca altera regras sem sua autorização</b>)."
+            )
+            learn_lbl.setWordWrap(True)
+            layout.addWidget(learn_lbl)
+
+            self.learning_table = QtWidgets.QTableWidget(0, 5)
+            self.learning_table.setAlternatingRowColors(True)
+            self.learning_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.learning_table.verticalHeader().setVisible(False)
+            self.learning_table.verticalHeader().setDefaultSectionSize(38)
+            self.learning_table.setMaximumHeight(165)
+            self.learning_table.setHorizontalHeaderLabels(
+                ["Regra Sugerida", "Ocorrências", "Destino Escolhido", "Exemplos", "Autorização"]
+            )
+            lh = self.learning_table.horizontalHeader()
+            lh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.learning_table.setColumnWidth(0, 260)
+            lh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.learning_table.setColumnWidth(1, 95)
+            lh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.learning_table.setColumnWidth(2, 220)
+            lh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            lh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.learning_table.setColumnWidth(4, 230)
+            layout.addWidget(self.learning_table)
+
+            # Bottom: 13. File Memory (Memória dos arquivos)
+            mem_top = QtWidgets.QHBoxLayout()
+            mem_top.addWidget(QtWidgets.QLabel("<b>📜 Memória dos Arquivos (Origem, Regra, Movimentações e Motivo)</b>"))
+            self.memory_search_edit = QtWidgets.QLineEdit()
+            self.memory_search_edit.setPlaceholderText("Filtrar memória por arquivo, origem ou regra...")
+            self.memory_search_edit.textChanged.connect(lambda: self._populate_memory_table())
+            mem_top.addWidget(self.memory_search_edit, 1)
+            layout.addLayout(mem_top)
+
+            mem_split = QtWidgets.QHBoxLayout()
+            self.memory_table = QtWidgets.QTableWidget(0, 5)
+            self.memory_table.setAlternatingRowColors(True)
+            self.memory_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.memory_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.memory_table.verticalHeader().setVisible(False)
+            self.memory_table.verticalHeader().setDefaultSectionSize(36)
+            self.memory_table.setHorizontalHeaderLabels(
+                ["Arquivo Atual", "Onde Foi Encontrado (Original)", "Regra", "Movimentos", "Último Motivo"]
+            )
+            mh = self.memory_table.horizontalHeader()
+            mh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.memory_table.setColumnWidth(0, 220)
+            mh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.memory_table.setColumnWidth(1, 250)
+            mh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.memory_table.setColumnWidth(2, 160)
+            mh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.memory_table.setColumnWidth(3, 85)
+            mh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.memory_table.cellClicked.connect(self.on_memory_row_clicked)
+            mem_split.addWidget(self.memory_table, 3)
+
+            self.memory_detail_box = QtWidgets.QTextEdit()
+            self.memory_detail_box.setReadOnly(True)
+            self.memory_detail_box.setPlaceholderText("Clique em qualquer arquivo para ver a linha do tempo completa de movimentações...")
+            self.memory_detail_box.setStyleSheet(
+                "background-color: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 10px; color: #e2e8f0;"
+            )
+            mem_split.addWidget(self.memory_detail_box, 2)
+            layout.addLayout(mem_split, 1)
+
+            self.tabs.addTab(tab, "📜 Memória & Aprendizado")
+
+        def _build_report_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            top_r = QtWidgets.QHBoxLayout()
+            top_r.addWidget(QtWidgets.QLabel("<b>📈 Relatório de Organização</b>"))
+            self.report_period_combo = QtWidgets.QComboBox()
+            self.report_period_combo.addItem("Semanal (Últimos 7 dias)", 7)
+            self.report_period_combo.addItem("Mensal (Últimos 30 dias)", 30)
+            self.report_period_combo.currentIndexChanged.connect(lambda: self._populate_report_tab())
+            top_r.addWidget(self.report_period_combo)
+            top_r.addStretch()
+
+            btn_export_md = QtWidgets.QPushButton("📄 Salvar Relatório (.md)")
+            btn_export_md.setObjectName("PrimaryBtn")
+            btn_export_md.clicked.connect(self.on_export_report_markdown)
+            top_r.addWidget(btn_export_md)
+            layout.addLayout(top_r)
+
+            self.report_cards_layout = QtWidgets.QHBoxLayout()
+            self.report_cards_layout.setSpacing(10)
+            layout.addLayout(self.report_cards_layout)
+
+            bottom = QtWidgets.QHBoxLayout()
+            bottom.setSpacing(12)
+
+            rules_col = QtWidgets.QVBoxLayout()
+            rules_col.addWidget(QtWidgets.QLabel("<b>🏆 Regras Mais Utilizadas no Período</b>"))
+            self.report_rules_table = QtWidgets.QTableWidget(0, 2)
+            self.report_rules_table.setAlternatingRowColors(True)
+            self.report_rules_table.verticalHeader().setVisible(False)
+            self.report_rules_table.setHorizontalHeaderLabels(["Regra", "Execuções"])
+            self.report_rules_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.report_rules_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.report_rules_table.setColumnWidth(1, 100)
+            rules_col.addWidget(self.report_rules_table)
+            bottom.addLayout(rules_col, 1)
+
+            grow_col = QtWidgets.QVBoxLayout()
+            grow_col.addWidget(QtWidgets.QLabel("<b>📂 Pastas que Mais Cresceram / Maiores Pastas</b>"))
+            self.report_growth_table = QtWidgets.QTableWidget(0, 3)
+            self.report_growth_table.setAlternatingRowColors(True)
+            self.report_growth_table.verticalHeader().setVisible(False)
+            self.report_growth_table.setHorizontalHeaderLabels(["Pasta", "Tamanho Atual", "Crescimento (Δ)"])
+            self.report_growth_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            self.report_growth_table.setColumnWidth(1, 110)
+            self.report_growth_table.setColumnWidth(2, 110)
+            grow_col.addWidget(self.report_growth_table)
+            bottom.addLayout(grow_col, 1)
+
+            layout.addLayout(bottom, 1)
+            self.tabs.addTab(tab, "📈 Relatório")
+
+        def _build_apps_tab(self):
+            tab = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(tab)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            top_a = QtWidgets.QHBoxLayout()
+            self.apps_search_edit = QtWidgets.QLineEdit()
+            self.apps_search_edit.setPlaceholderText("🧩 Buscar aplicativo instalado, ferramenta portátil, instalador arquivado ou projeto...")
+            self.apps_search_edit.textChanged.connect(self._filter_apps_table)
+            top_a.addWidget(self.apps_search_edit, 1)
+
+            btn_scan_apps = QtWidgets.QPushButton("🔄 Atualizar Catálogo de Aplicativos")
+            btn_scan_apps.setObjectName("PrimaryBtn")
+            btn_scan_apps.clicked.connect(self.on_refresh_app_catalog)
+            top_a.addWidget(btn_scan_apps)
+            layout.addLayout(top_a)
+
+            self.apps_table = QtWidgets.QTableWidget(0, 6)
+            self.apps_table.setAlternatingRowColors(True)
+            self.apps_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.apps_table.verticalHeader().setVisible(False)
+            self.apps_table.verticalHeader().setDefaultSectionSize(38)
+            self.apps_table.setHorizontalHeaderLabels(
+                ["Aplicativo / Ferramenta", "Origem / Versão", "Instalador Arquivado", "Docs / Projetos Associados", "Executável", "Ações"]
+            )
+            ah = self.apps_table.horizontalHeader()
+            ah.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.apps_table.setColumnWidth(0, 220)
+            ah.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.apps_table.setColumnWidth(1, 150)
+            ah.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.apps_table.setColumnWidth(2, 200)
+            ah.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            ah.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.apps_table.setColumnWidth(4, 210)
+            ah.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self.apps_table.setColumnWidth(5, 130)
+            layout.addWidget(self.apps_table, 1)
+
+            self.tabs.addTab(tab, "🧩 Apps & Ferramentas")
+
+        def _build_explorer_vault_tab(self):
+            tab = QtWidgets.QWidget()
+            split = QtWidgets.QHBoxLayout(tab)
+            split.setContentsMargins(14, 14, 14, 14)
+            split.setSpacing(14)
+
+            # Left: 16. Windows Explorer Context Menu Integration
+            exp_card = QtWidgets.QFrame()
+            exp_card.setObjectName("SurfaceCard")
+            el = QtWidgets.QVBoxLayout(exp_card)
+            el.setContentsMargins(18, 18, 18, 18)
+            el.setSpacing(10)
+
+            lbl_e = QtWidgets.QLabel("🖱️ <b>16. Integração com o Explorador do Windows</b>")
+            lbl_e.setStyleSheet("font-size: 15px; color: #60a5fa;")
+            el.addWidget(lbl_e)
+
+            self.lbl_explorer_status = QtWidgets.QLabel("Verificando status do menu de contexto...")
+            self.lbl_explorer_status.setWordWrap(True)
+            el.addWidget(self.lbl_explorer_status)
+
+            el.addWidget(
+                QtWidgets.QLabel(
+                    "Adiciona ao clique direito (Arquivos e Pastas, sem precisar de Admin):\n"
+                    "  • Organizar com Vida Organizer\n"
+                    "  • Enviar para F:\\Vida\n"
+                    "  • Adicionar aos fixados (Ignorar)\n"
+                    "  • Analisar duplicados\n"
+                    "  • Abrir pasta de destino"
+                )
+            )
+
+            row_e = QtWidgets.QHBoxLayout()
+            btn_inst_ctx = QtWidgets.QPushButton("✅ Instalar Menu de Contexto no Explorer")
+            btn_inst_ctx.setObjectName("PrimaryBtn")
+            btn_inst_ctx.clicked.connect(self.on_install_explorer_menu)
+            row_e.addWidget(btn_inst_ctx)
+
+            btn_uninst_ctx = QtWidgets.QPushButton("🗑️ Remover Menu")
+            btn_uninst_ctx.setObjectName("DangerBtn")
+            btn_uninst_ctx.clicked.connect(self.on_uninstall_explorer_menu)
+            row_e.addWidget(btn_uninst_ctx)
+            el.addLayout(row_e)
+
+            self.reg_preview_edit = QtWidgets.QPlainTextEdit()
+            self.reg_preview_edit.setReadOnly(True)
+            self.reg_preview_edit.setStyleSheet("background-color: #0b0f19; font-family: Consolas; font-size: 11px;")
+            el.addWidget(self.reg_preview_edit, 1)
+            split.addWidget(exp_card, 1)
+
+            # Right: 20. Config Vault (Cofre de Configurações)
+            vault_card = QtWidgets.QFrame()
+            vault_card.setObjectName("SurfaceCard")
+            vl = QtWidgets.QVBoxLayout(vault_card)
+            vl.setContentsMargins(18, 18, 18, 18)
+            vl.setSpacing(10)
+
+            lbl_v = QtWidgets.QLabel("🔐 <b>20. Cofre de Configurações (Backup & Migração de PC)</b>")
+            lbl_v.setStyleSheet("font-size: 15px; color: #10b981;")
+            vl.addWidget(lbl_v)
+            vl.addWidget(
+                QtWidgets.QLabel(
+                    "Exporte ou importe toda a sua configuração em um arquivo .zip portátil para reinstalar o Windows ou migrar de computador:"
+                )
+            )
+
+            self.vault_checks: dict[str, QtWidgets.QCheckBox] = {}
+            vault_items = [
+                ("rules", "🎨 Regras de organização automática", True),
+                ("folcolor", "🌈 Mapa de cores Folcolor", True),
+                ("ignored_paths", "📌 Arquivos e pastas fixados/ignorados", True),
+                ("workspaces", "🧭 Espaços de trabalho personalizados", True),
+                ("tags", "🏷️ Etiquetas inteligentes", True),
+                ("preferences", "⚙️ Preferências e cooldowns", True),
+                ("folder_structure", "🌳 Estrutura de pastas PARA do F:\\Vida", True),
+                ("history_db", "🗄️ Banco SQLite completo + Histórico/Memória", False),
+            ]
+            for key, text, default_chk in vault_items:
+                chk = QtWidgets.QCheckBox(text)
+                chk.setChecked(default_chk)
+                vl.addWidget(chk)
+                self.vault_checks[key] = chk
+
+            vl.addStretch()
+            btn_exp_v = QtWidgets.QPushButton("📤 Exportar Cofre de Configurações (.zip)...")
+            btn_exp_v.setObjectName("PrimaryBtn")
+            btn_exp_v.clicked.connect(self.on_export_vault)
+            vl.addWidget(btn_exp_v)
+
+            btn_imp_v = QtWidgets.QPushButton("📥 Importar Cofre de Configurações (.zip)...")
+            btn_imp_v.setObjectName("PurpleBtn")
+            btn_imp_v.clicked.connect(self.on_import_vault)
+            vl.addWidget(btn_imp_v)
+
+            split.addWidget(vault_card, 1)
+            self.tabs.addTab(tab, "🛡️ Explorer & Cofre")
+
         def trigger_async_scan(self):
             if self.scan_worker and self.scan_worker.isRunning():
                 return
@@ -1468,12 +1998,17 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                 self.btn_undo.setEnabled(False)
                 self.btn_undo.setText("↩ Desfazer Última Ação")
 
+            self._render_workspaces_bar()
             self._render_health_cards()
             self._update_pill_counts()
             self._populate_queue_table()
+            self._populate_inbox_zero_tab()
             self._populate_duplicates_tab()
             self.on_run_semantic_search()
+            self._populate_memory_learning_tab()
             self._populate_storage_tab()
+            self._populate_report_tab()
+            self._populate_explorer_vault_tab()
             self._populate_vida_tree()
             self._populate_rules_table()
             self._populate_ignored_table()
@@ -1694,6 +2229,12 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
             folder_filter = (
                 str(Path(self.current_folder_filter)).lower() if self.current_folder_filter else None
             )
+            active_ws = self.ctrl.get_active_workspace()
+            ws_terms = (
+                [t.lower() for t in [*active_ws.get("keywords", []), *active_ws.get("favorite_folders", [])]]
+                if active_ws
+                else []
+            )
 
             self.table.setUpdatesEnabled(False)
             try:
@@ -1712,6 +2253,14 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     if visible and folder_filter:
                         src_norm = str(Path(item["source_path"])).lower()
                         if not src_norm.startswith(folder_filter):
+                            visible = False
+                    if visible and ws_terms:
+                        ws_haystack = (
+                            f"{item.get('source_path', '')} "
+                            f"{item.get('target_path', '')} "
+                            f"{item.get('rule_name', '')}"
+                        ).lower().replace("\\", "/")
+                        if not any(term in ws_haystack for term in ws_terms):
                             visible = False
                     if visible and query:
                         haystack = (
@@ -2427,14 +2976,384 @@ def create_desktop_window(config: AppConfig | None = None, auto_scan_async: bool
                     act_l.addWidget(lbl_u)
                 self.history_table.setCellWidget(idx, 4, act_w)
 
+        # --- 17. Workspaces Bar ---
+        def _render_workspaces_bar(self):
+            while self.ws_layout.count():
+                ch = self.ws_layout.takeAt(0)
+                if ch.widget():
+                    ch.widget().deleteLater()
+
+            lbl = QtWidgets.QLabel("<b>🧭 Espaço de Trabalho:</b>")
+            lbl.setStyleSheet("color: #93c5fd; font-size: 12px;")
+            self.ws_layout.addWidget(lbl)
+
+            workspaces = self.ctrl.state.get("workspaces") or self.ctrl.db.list_workspaces()
+            active_ws = None
+
+            btn_all = QtWidgets.QPushButton("🌐 Todos")
+            btn_all.setObjectName("FilterPill")
+            any_active = any(w.get("is_active") for w in workspaces)
+            btn_all.setProperty("active", "false" if any_active else "true")
+            btn_all.clicked.connect(lambda: self.on_activate_workspace("__ALL__"))
+            self.ws_layout.addWidget(btn_all)
+
+            for ws in workspaces:
+                is_act = bool(ws.get("is_active"))
+                if is_act:
+                    active_ws = ws
+                b = QtWidgets.QPushButton(f"{ws.get('icon', '📁')} {ws['name']}")
+                b.setObjectName("FilterPill")
+                b.setProperty("active", "true" if is_act else "false")
+                b.setToolTip(ws.get("description", ""))
+                b.clicked.connect(lambda checked=False, wn=ws["name"]: self.on_activate_workspace(wn))
+                self.ws_layout.addWidget(b)
+
+            self.ws_layout.addStretch()
+
+            if active_ws:
+                for sc in active_ws.get("shortcuts", [])[:3]:
+                    raw_p = Path(sc["path"])
+                    full_p = raw_p if raw_p.is_absolute() else (self.ctrl.config.vida_root / raw_p)
+                    sb = QtWidgets.QPushButton(f"📂 {sc['label']}")
+                    sb.setToolTip(str(full_p))
+                    sb.clicked.connect(lambda checked=False, p=str(full_p): self.ctrl.open_in_explorer(p))
+                    self.ws_layout.addWidget(sb)
+
+        def on_activate_workspace(self, name: str):
+            ws = self.ctrl.activate_workspace(name)
+            if ws:
+                self.lbl_status.setText(f"{ws.get('icon', '')} Espaço de trabalho ativo: {ws['name']} — {ws.get('description', '')}")
+            else:
+                self.lbl_status.setText("🌐 Modo global ativo (mostrando todos os espaços).")
+            self._render_workspaces_bar()
+            self.apply_filters()
+
+        # --- 15. Inbox Zero Kanban Logic ---
+        def _populate_inbox_zero_tab(self):
+            for lst in self.kanban_lists.values():
+                lst.clear()
+            t_map = self.ctrl.state.get("triage_states") or self.ctrl.db.get_triage_states_map()
+            queue = self.ctrl.state.get("queue", [])
+
+            counts = {"entrada": 0, "em_analise": 0, "organizado": 0}
+            for item in queue:
+                if item.get("category") == "icone_pendente":
+                    continue
+                st = t_map.get(item["id"])
+                if st:
+                    col = st["column_name"]
+                elif item.get("category") == "pronto_para_mover" and item.get("cooldown_ready"):
+                    col = "organizado"
+                else:
+                    col = "entrada"
+                if col not in self.kanban_lists:
+                    col = "entrada"
+                counts[col] += 1
+
+                src_name = Path(item["source_path"]).name
+                dst_name = Path(item.get("target_path", "")).parent.name or item.get("target_path", "")
+                sz_txt = format_bytes(int(item.get("size_bytes", 0)))
+                li = QtWidgets.QListWidgetItem(
+                    f"📄 {src_name} ({sz_txt})\n➜ {dst_name} · {item.get('rule_name', '')}"
+                )
+                li.setData(QtCore.Qt.ItemDataRole.UserRole, item["id"])
+                li.setToolTip(f"Origem: {item['source_path']}\nDestino: {item.get('target_path', '')}")
+                self.kanban_lists[col].addItem(li)
+
+            self.kanban_headers["entrada"].setText(f"🗂️ Entrada — Arquivos Novos ({counts['entrada']})")
+            self.kanban_headers["em_analise"].setText(f"🔍 Em Análise — Aguardando Decisão ({counts['em_analise']})")
+            self.kanban_headers["organizado"].setText(f"✅ Organizado — Destino Confirmado ({counts['organizado']})")
+
+        def on_kanban_item_dropped(self, item_id: str, column_name: str):
+            self.ctrl.set_kanban_column(item_id, column_name)
+            self._populate_inbox_zero_tab()
+            self.lbl_status.setText(f"📥 Card movido para a coluna '{column_name}'.")
+
+        def on_kanban_move_selected(self, src_col: str, dst_col: str):
+            lst = self.kanban_lists.get(src_col)
+            if not lst:
+                return
+            sel = lst.selectedItems()
+            if not sel:
+                self.lbl_status.setText("⚠️ Selecione 1 ou mais cards na coluna para mover.")
+                return
+            for it in sel:
+                iid = str(it.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                if iid:
+                    self.ctrl.set_kanban_column(iid, dst_col)
+            self._populate_inbox_zero_tab()
+
+        def on_kanban_double_clicked(self, list_item: QtWidgets.QListWidgetItem):
+            iid = str(list_item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+            if iid:
+                self.open_edit_dialog_by_id(iid)
+
+        def on_kanban_edit_selected(self):
+            for lst in self.kanban_lists.values():
+                sel = lst.selectedItems()
+                if sel:
+                    iid = str(sel[0].data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                    if iid:
+                        self.open_edit_dialog_by_id(iid)
+                        return
+            self.lbl_status.setText("⚠️ Selecione um card no Kanban para editar nome/destino.")
+
+        def on_kanban_execute_confirmed(self):
+            lst = self.kanban_lists["organizado"]
+            ids = [
+                str(lst.item(i).data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                for i in range(lst.count())
+            ]
+            ids = [x for x in ids if x]
+            if not ids:
+                self.lbl_status.setText("⚠️ A coluna 'Organizado (Destino Confirmado)' está vazia.")
+                return
+            res = self.ctrl.execute_items(ids, include_trash=True, recoverable_mode="archive")
+            self.lbl_status.setText(f"📥 Inbox Zero: {res['executed_count']} arquivo(s) confirmado(s) executado(s)!")
+            self.render_all()
+
+        # --- 13 & 14. File Memory & Decision Learning Logic ---
+        def _populate_memory_learning_tab(self):
+            # 14. Learning suggestions
+            sugs = self.ctrl.state.get("rule_suggestions") or self.ctrl.db.list_rule_suggestions(min_occurrences=2)
+            self.learning_table.setRowCount(len(sugs))
+            for idx, s in enumerate(sugs):
+                self.learning_table.setItem(idx, 0, QtWidgets.QTableWidgetItem(s["suggested_rule_name"]))
+                self.learning_table.setItem(idx, 1, QtWidgets.QTableWidgetItem(f"{s['count']}x correções"))
+                self.learning_table.setItem(idx, 2, QtWidgets.QTableWidgetItem(f"F:\\Vida\\{s['target_subpath']}"))
+                self.learning_table.setItem(idx, 3, QtWidgets.QTableWidgetItem(", ".join(s.get("sample_files", []))))
+
+                w = QtWidgets.QWidget()
+                wl = QtWidgets.QHBoxLayout(w)
+                wl.setContentsMargins(4, 2, 4, 2)
+                wl.setSpacing(4)
+                b_acc = QtWidgets.QPushButton("✅ Autorizar Regra")
+                b_acc.setObjectName("PrimaryBtn")
+                b_acc.clicked.connect(
+                    lambda checked=False, sk=s["signature_key"]: (
+                        self.ctrl.accept_rule_suggestion(sk),
+                        self.render_all(),
+                    )
+                )
+                wl.addWidget(b_acc)
+
+                b_dis = QtWidgets.QPushButton("✖ Ignorar")
+                b_dis.clicked.connect(
+                    lambda checked=False, sk=s["signature_key"]: (
+                        self.ctrl.dismiss_rule_suggestion(sk),
+                        self._populate_memory_learning_tab(),
+                    )
+                )
+                wl.addWidget(b_dis)
+                self.learning_table.setCellWidget(idx, 4, w)
+
+            self._populate_memory_table()
+
+        def _populate_memory_table(self):
+            q = self.memory_search_edit.text().strip() if hasattr(self, "memory_search_edit") else ""
+            mems = self.ctrl.get_file_memories(search=q)
+            self.memory_table.setRowCount(len(mems))
+            for idx, m in enumerate(mems):
+                name_it = QtWidgets.QTableWidgetItem(f"📄 {Path(m['current_path']).name}")
+                name_it.setData(QtCore.Qt.ItemDataRole.UserRole, m)
+                name_it.setToolTip(m["current_path"])
+                self.memory_table.setItem(idx, 0, name_it)
+                self.memory_table.setItem(idx, 1, QtWidgets.QTableWidgetItem(m["original_path"]))
+                self.memory_table.setItem(idx, 2, QtWidgets.QTableWidgetItem(m.get("rule_name", "") or "Manual"))
+                self.memory_table.setItem(idx, 3, QtWidgets.QTableWidgetItem(f"{m.get('move_count', 1)}x"))
+                self.memory_table.setItem(idx, 4, QtWidgets.QTableWidgetItem(m.get("last_reason", "")))
+
+        def on_memory_row_clicked(self, row: int, _col: int):
+            it = self.memory_table.item(row, 0)
+            if not it:
+                return
+            m = it.data(QtCore.Qt.ItemDataRole.UserRole)
+            if not m:
+                return
+            lines = [
+                f"📄 Arquivo: {Path(m['current_path']).name}",
+                f"📍 Onde foi encontrado originalmente:\n   {m['original_path']}",
+                f"📂 Local atual:\n   {m['current_path']}",
+                f"🎨 Regra classificadora: {m.get('rule_name') or 'Nenhuma'}",
+                f"🔁 Vezes que mudou de localização: {m.get('move_count', 1)}",
+                f"💬 Motivo da última movimentação: {m.get('last_reason', '')}",
+                "",
+                "🕒 Linha do tempo de eventos:",
+            ]
+            for ev in m.get("events", []):
+                lines.append(
+                    f"  • [{ev['created_at'][:19]}] ({ev['event_type']}) "
+                    f"{Path(ev['from_path']).name}: {ev['from_path']} ➜ {ev['to_path']} ({ev['reason']})"
+                )
+            self.memory_detail_box.setPlainText("\n".join(lines))
+
+        # --- 18. Report Tab Logic ---
+        def _populate_report_tab(self):
+            days = int(self.report_period_combo.currentData() or 7)
+            rep = self.ctrl.get_organization_report(period_days=days)
+
+            while self.report_cards_layout.count():
+                ch = self.report_cards_layout.takeAt(0)
+                if ch.widget():
+                    ch.widget().deleteLater()
+
+            kpis = [
+                ("Arquivos Organizados", str(rep["organized_count"]), "#10b981"),
+                ("Espaço Recuperado", format_bytes(rep["recovered_bytes"]), "#3b82f6"),
+                ("Duplicados Identificados", f"{rep['duplicates_groups_count']} grupos", "#f59e0b"),
+                ("Pendentes na Fila", str(rep["pending_count"]), "#8b5cf6"),
+                ("Operações Desfeitas", f"{rep['undone_batches_count']} lotes", "#ef4444"),
+            ]
+            for title, val, col in kpis:
+                card = QtWidgets.QFrame()
+                card.setObjectName("SurfaceCard")
+                card.setStyleSheet(
+                    f"QFrame#SurfaceCard {{ background-color: #111827; border: 1px solid {col}; border-radius: 8px; }}"
+                )
+                cl = QtWidgets.QVBoxLayout(card)
+                cl.setContentsMargins(12, 10, 12, 10)
+                l1 = QtWidgets.QLabel(title)
+                l1.setStyleSheet("color: #94a3b8; font-size: 11px;")
+                l2 = QtWidgets.QLabel(val)
+                l2.setStyleSheet(f"color: {col}; font-size: 18px; font-weight: 700;")
+                cl.addWidget(l1)
+                cl.addWidget(l2)
+                self.report_cards_layout.addWidget(card, 1)
+
+            top_rules = rep.get("top_rules", [])
+            self.report_rules_table.setRowCount(len(top_rules))
+            for i, r in enumerate(top_rules):
+                self.report_rules_table.setItem(i, 0, QtWidgets.QTableWidgetItem(r["rule_name"]))
+                self.report_rules_table.setItem(i, 1, QtWidgets.QTableWidgetItem(str(r["count"])))
+
+            top_grow = rep.get("top_growing_folders", [])
+            self.report_growth_table.setRowCount(len(top_grow))
+            for i, g in enumerate(top_grow):
+                self.report_growth_table.setItem(i, 0, QtWidgets.QTableWidgetItem(g["name"]))
+                self.report_growth_table.setItem(i, 1, QtWidgets.QTableWidgetItem(format_bytes(int(g.get("current_bytes", 0)))))
+                self.report_growth_table.setItem(i, 2, QtWidgets.QTableWidgetItem(f"+{format_bytes(int(g.get('delta_bytes', 0)))}"))
+
+        def on_export_report_markdown(self):
+            days = int(self.report_period_combo.currentData() or 7)
+            md = self.ctrl.get_organization_report_markdown(period_days=days)
+            dst, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Salvar Relatório de Organização",
+                str(self.ctrl.config.vida_root / f"Relatorio_Vida_Organizer_{days}d.md"),
+                "Markdown (*.md);;Todos (*.*)",
+            )
+            if dst:
+                Path(dst).write_text(md, encoding="utf-8")
+                self.lbl_status.setText(f"📄 Relatório salvo em {dst}!")
+
+        # --- 19. App & Tools Catalog Logic ---
+        def on_refresh_app_catalog(self):
+            apps = self.ctrl.get_app_catalog(include_registry=True)
+            self._populate_apps_table(apps)
+            self.lbl_status.setText(f"🧩 Catálogo atualizado: {len(apps)} aplicativo(s)/ferramenta(s) indexado(s).")
+
+        def _populate_apps_table(self, apps: list[dict[str, Any]] | None = None):
+            items = apps if apps is not None else self.ctrl.state.get("app_catalog", [])
+            self.apps_table.setRowCount(len(items))
+            for idx, a in enumerate(items):
+                self.apps_table.setItem(idx, 0, QtWidgets.QTableWidgetItem(a["name"]))
+                self.apps_table.setItem(idx, 1, QtWidgets.QTableWidgetItem(f"{a.get('source', '')} ({a.get('version', '') or '-'})"))
+                inst_txt = ", ".join(Path(p).name for p in a.get("archived_installers", [])) or "—"
+                self.apps_table.setItem(idx, 2, QtWidgets.QTableWidgetItem(inst_txt))
+                assoc = [
+                    *(f"📄 {Path(d).name}" for d in a.get("related_docs", [])),
+                    *(f"💻 {Path(p).name}" for p in a.get("related_projects", [])),
+                ]
+                self.apps_table.setItem(idx, 3, QtWidgets.QTableWidgetItem(" · ".join(assoc) or "—"))
+                self.apps_table.setItem(idx, 4, QtWidgets.QTableWidgetItem(a.get("exe_path") or a.get("install_location") or "—"))
+
+                w = QtWidgets.QWidget()
+                wl = QtWidgets.QHBoxLayout(w)
+                wl.setContentsMargins(2, 2, 2, 2)
+                exe_or_dir = a.get("exe_path") or a.get("install_location")
+                if exe_or_dir:
+                    b_op = QtWidgets.QPushButton("📂 Pasta")
+                    b_op.clicked.connect(lambda checked=False, p=exe_or_dir: self.ctrl.open_in_explorer(p))
+                    wl.addWidget(b_op)
+                if a.get("exe_path") and Path(a["exe_path"]).exists():
+                    b_run = QtWidgets.QPushButton("▶ Abrir")
+                    b_run.clicked.connect(
+                        lambda checked=False, ep=a["exe_path"]: os.startfile(ep) if os.name == "nt" else None
+                    )
+                    wl.addWidget(b_run)
+                self.apps_table.setCellWidget(idx, 5, w)
+            self._filter_apps_table()
+
+        def _filter_apps_table(self):
+            q = self.apps_search_edit.text().strip().lower() if hasattr(self, "apps_search_edit") else ""
+            for r in range(self.apps_table.rowCount()):
+                if not q:
+                    self.apps_table.setRowHidden(r, False)
+                    continue
+                row_txt = " ".join(
+                    (self.apps_table.item(r, c).text() if self.apps_table.item(r, c) else "")
+                    for c in range(5)
+                ).lower()
+                self.apps_table.setRowHidden(r, q not in row_txt)
+
+        # --- 16 & 20. Explorer Integration & Config Vault Logic ---
+        def _populate_explorer_vault_tab(self):
+            st = self.ctrl.get_explorer_status()
+            if st["installed"]:
+                self.lbl_explorer_status.setText("🟢 <b>Menu de contexto INSTALADO</b> no Windows Explorer (HKCU).")
+                self.lbl_explorer_status.setStyleSheet("color: #10b981;")
+            else:
+                self.lbl_explorer_status.setText("⚪ <b>Menu de contexto ainda não instalado.</b> Clique abaixo para ativar no Explorer.")
+                self.lbl_explorer_status.setStyleSheet("color: #f59e0b;")
+            self.reg_preview_edit.setPlainText(st["spec"]["reg_content"])
+
+        def on_install_explorer_menu(self):
+            res = self.ctrl.install_explorer_menu()
+            self._populate_explorer_vault_tab()
+            self.lbl_status.setText(f"🖱️ Menu de contexto instalado ({res.get('entries', 5)} comandos no Explorer)!")
+
+        def on_uninstall_explorer_menu(self):
+            self.ctrl.uninstall_explorer_menu()
+            self._populate_explorer_vault_tab()
+            self.lbl_status.setText("🗑️ Menu de contexto removido do Windows Explorer.")
+
+        def on_export_vault(self):
+            opts = {k: chk.isChecked() for k, chk in self.vault_checks.items()}
+            dst, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Exportar Cofre de Configurações",
+                str(self.ctrl.config.vida_root / "Vida_Organizer_Vault.zip"),
+                "ZIP Backup (*.zip)",
+            )
+            if not dst:
+                return
+            res = self.ctrl.export_vault(dst, opts)
+            self.lbl_status.setText(f"🔐 Cofre exportado ({format_bytes(res['size_bytes'])}) em {res['zip_path']}!")
+
+        def on_import_vault(self):
+            opts = {k: chk.isChecked() for k, chk in self.vault_checks.items()}
+            src, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Importar Cofre de Configurações",
+                str(self.ctrl.config.vida_root),
+                "ZIP Backup (*.zip)",
+            )
+            if not src:
+                return
+            res = self.ctrl.import_vault(src, opts)
+            self.render_all()
+            self.lbl_status.setText(f"📥 Cofre restaurado com sucesso: {res['restored']}")
+
     ctrl = DesktopController(config)
     win = VidaMainWindow(ctrl)
+    if 0 <= initial_tab < win.tabs.count():
+        win.tabs.setCurrentIndex(initial_tab)
     if auto_scan_async:
         QtCore.QTimer.singleShot(50, win.trigger_async_scan)
     return win
 
 
-def launch_desktop_app(config: AppConfig | None = None) -> None:
+def launch_desktop_app(config: AppConfig | None = None, initial_tab: int = 0) -> None:
     import ctypes
     from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -2453,7 +3372,7 @@ def launch_desktop_app(config: AppConfig | None = None) -> None:
         app.setWindowIcon(QtGui.QIcon(str(ico_file)))
     except Exception:
         pass
-    win = create_desktop_window(config, auto_scan_async=True)
+    win = create_desktop_window(config, auto_scan_async=True, initial_tab=initial_tab)
     win.show()
     win.raise_()
     win.activateWindow()

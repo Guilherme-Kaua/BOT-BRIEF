@@ -52,7 +52,35 @@ def main() -> None:
     parser.add_argument("--open", action="store_true", help="Abre o painel visual ao iniciar")
     parser.add_argument("--desktop-only", action="store_true", help="Abre diretamente a janela Desktop nativa")
     parser.add_argument("--port", type=int, default=18420, help="Porta local do painel (padrão: 18420)")
+    parser.add_argument("--ctx-organize", type=str, default="", help="Menu Explorer: organizar arquivo/pasta")
+    parser.add_argument("--ctx-send-vida", type=str, default="", help="Menu Explorer: enviar para F:\\Vida")
+    parser.add_argument("--ctx-pin", type=str, default="", help="Menu Explorer: adicionar aos fixados")
+    parser.add_argument("--ctx-duplicates", type=str, default="", help="Menu Explorer: analisar duplicados")
+    parser.add_argument("--ctx-open-target", type=str, default="", help="Menu Explorer: abrir pasta de destino")
     args = parser.parse_args()
+
+    # Handle Windows Explorer Context Menu actions (no server startup needed)
+    ctx_actions = [
+        ("organize", args.ctx_organize),
+        ("send_vida", args.ctx_send_vida),
+        ("pin", args.ctx_pin),
+        ("duplicates", args.ctx_duplicates),
+        ("open_target", args.ctx_open_target),
+    ]
+    for act_name, target_p in ctx_actions:
+        if target_p:
+            from app.engine.explorer_integration import execute_context_menu_action
+
+            cfg_ctx = AppConfig(port=args.port)
+            db_ctx = Database(cfg_ctx.db_path)
+            db_ctx.init_db()
+            res = execute_context_menu_action(act_name, target_p, cfg_ctx, db_ctx)
+            if act_name == "duplicates":
+                from app.desktop_gui import launch_desktop_app
+
+                launch_desktop_app(cfg_ctx, initial_tab=2)
+            print(res)
+            return
 
     if args.desktop_only or (args.open and _is_port_in_use(args.port)):
         from app.desktop_gui import launch_desktop_app
